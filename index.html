@@ -808,6 +808,9 @@ async function scan(btn){
   const logEl = document.getElementById('scan-log');
   const scanWrap = document.getElementById('scan-log-wrap');
   if (scanWrap) scanWrap.style.display = 'block';
+  // Reset per-scan UI buffers
+  _approachBarData = [];
+  _preAlertData    = [];
   logEl.className = 'scan-log show';
   logEl.innerHTML = '<span style="color:var(--txt3)">Connecting to signal server…</span>';
   // Clear any pending retry timer if user clicks scan manually
@@ -930,6 +933,8 @@ async function scan(btn){
       }
     });
     logEl.innerHTML = logLines.join('<br>') || '<span style="color:var(--txt3)">Scan complete — see Setup Status panel above for current stage.</span>';
+    // Render approach bar + pre-alerts once for all symbols (prevents XAG overwriting XAU)
+    flushScanUI();
 
   } catch(e) {
     console.error('Scan error:', e);
@@ -990,9 +995,9 @@ function updatePanel(id,d){
     biasEl.style.color = biasLabel==='BUY'?'var(--buy)':biasLabel==='SELL'?'var(--sell)':'var(--txt3)';
   }
 
-  // Approach bar + pre-alerts (anticipatory)
-  updateApproachBar(d);
-  updatePreAlerts(d);
+  // Approach bar + pre-alerts — accumulate across symbols, rendered after scan loop
+  _approachBarData.push(d);
+  _preAlertData.push(d);
   if(d.ratio){
     document.getElementById('sp-ratio').textContent=d.ratio.toFixed(1);
     document.getElementById('sp-ratio-c').textContent=d.ratio>=80?'Gold expensive vs Silver':d.ratio<=70?'Silver expensive vs Gold':'Near average';
@@ -1119,38 +1124,31 @@ function updateApproachBar(d) {
 }
 
 // PRE-ALERTS PANEL — shows contextual stage alerts
-function updatePreAlerts(d) {
-  const el = document.getElementById('pre-alerts');
-  if (!el) return;
+function buildPreAlertParts(d, dominantDir) {
   const parts = [];
+  const confirmedDir = dominantDir || d.near_setup?.direction || null;
 
-  // Suppress conflicting directions — if an active setup has confirmed direction,
-  // do not show approach cards in the opposite direction
-  const confirmedDir = d.near_setup?.direction || null;
-  // Sweep potential alerts — only show if there is NO near_setup already
-  // (near_setup is more informative and supersedes the approach card)
+  // Sweep potential alerts — only if no active stage-based near_setup
   const hasNearSetup = !!(d.near_setup && d.near_setup.stage !== 'approaching_liquidity');
   if (d.sweep_potentials && d.sweep_potentials.length && !hasNearSetup) {
-    // Show max 1 sweep potential card — from primary zone only
-    const spList = (d.primary_zone && d.sweep_potentials && d.sweep_potentials.length)
+    const spList = (d.primary_zone && d.sweep_potentials.length)
       ? d.sweep_potentials.filter(sp => {
-          // Drop cards that conflict with confirmed setup direction
-          if (!confirmedDir) return true;
           const spDir = (sp.level?.type === 'EQH' || sp.level?.type === 'PDH') ? 'SELL'
                       : (sp.level?.type === 'EQL' || sp.level?.type === 'PDL') ? 'BUY'
                       : sp.direction;
-          return spDir === confirmedDir;
+          // Block if conflicts with dominant confirmed direction
+          if (confirmedDir && spDir !== confirmedDir) return false;
+          return true;
         }).slice(0, 1)
       : [];
     spList.forEach(sp => {
-      // Derive direction from zone type — never trust geometry-based direction
       const lvlType2 = sp.level?.type || '';
       const corrDir  = (lvlType2 === 'EQH' || lvlType2 === 'PDH' || lvlType2 === 'ASH') ? 'SELL'
                      : (lvlType2 === 'EQL' || lvlType2 === 'PDL' || lvlType2 === 'ASL') ? 'BUY'
                      : sp.direction;
-      const isBuy  = corrDir === 'BUY';
-      const aName  = d.symbol === 'XAUUSD' ? 'GOLD' : 'SILVER';
-      const pz2    = d.primary_zone;
+      const isBuy    = corrDir === 'BUY';
+      const aName    = d.symbol === 'XAUUSD' ? 'GOLD' : 'SILVER';
+      const pz2      = d.primary_zone;
       const zoneTitle = pz2
         ? aName + ' — PRIMARY ' + corrDir + ' ZONE'
         : aName + ' — KEY LEVEL NEARBY';
@@ -1159,32 +1157,34 @@ function updatePreAlerts(d) {
           '<div class="pac-head">' +
             '<span class="pac-icon">📍</span>' +
             '<span class="pac-title">' + zoneTitle + '</span>' +
-            '<span class="pac-dir ' + (isBuy?'buy':'sell') + '">' + sp.direction + '</span>' +
+            '<span class="pac-dir ' + (isBuy?'buy':'sell') + '">' + corrDir + '</span>' +
           '</div>' +
           '<div class="pac-body">' + sp.message + '</div>' +
           '<div class="pac-action">No trade yet. Monitor for a sweep through this zone and reversal.</div>' +
-          (d.primary_zone && d.primary_zone.confidence ? '<div class="conf-badge ' + (d.primary_zone.confidence.grade||'').toLowerCase() + '" style="margin-top:4px">' +
-            (d.primary_zone.confidence.emoji||'') + ' Zone confidence: ' + d.primary_zone.confidence.total + '/100 — ' + (d.primary_zone.confidence.grade||'') + '</div>' : '') +
+          (pz2 && pz2.confidence ? '<div style="font-family:var(--mono);font-size:8px;color:var(--txt3);margin-top:4px">' +
+            (pz2.confidence.emoji||'') + ' Zone confidence: ' + pz2.confidence.total + '/100</div>' : '') +
         '</div>'
       );
     });
   }
 
-  // Stage-based pre-signal alerts
+  // Stage-based pre-signal
   if (d.near_setup) {
     const ns      = d.near_setup;
     const alert   = ns.alert || {};
-    // Derive direction from level type if available
     const nsLvlType = ns.level?.type || '';
     const nsCorrDir = (nsLvlType === 'EQH' || nsLvlType === 'PDH' || nsLvlType === 'ASH') ? 'SELL'
                     : (nsLvlType === 'EQL' || nsLvlType === 'PDL' || nsLvlType === 'ASL') ? 'BUY'
                     : ns.direction;
+    // Block if this direction conflicts with dominant confirmed direction
+    if (dominantDir && nsCorrDir && nsCorrDir !== dominantDir) {
+      return parts; // skip conflicting pre-alert
+    }
     const isBuy   = nsCorrDir === 'BUY';
     const aName   = d.symbol === 'XAUUSD' ? 'GOLD' : 'SILVER';
     const icons   = { approaching_liquidity:'📍', sweep_detected:'⚡', displacement_confirmed:'↗', structure_break:'✅' };
     const icon    = icons[ns.stage] || '📡';
-    // For zone-based setups, enrich the headline with zone range
-    let headline = alert.headline || (icon + ' ' + aName + ' — ' + ns.stage.replace(/_/g,' ').toUpperCase());
+    let headline  = alert.headline || (icon + ' ' + aName + ' — ' + ns.stage.replace(/_/g,' ').toUpperCase());
     if (ns.level && ns.level.isZone && ns.stage === 'sweep_detected') {
       const lo = parseFloat(ns.level.minPrice).toFixed(2);
       const hi = parseFloat(ns.level.maxPrice).toFixed(2);
@@ -1192,29 +1192,35 @@ function updatePreAlerts(d) {
     }
     const context  = alert.context  || ns.message;
     const action   = alert.action   || 'Monitoring. No action required yet.';
-    const biasText = alert.bias     || '—';
     const sessText = alert.session  || d.session || '—';
-
+    const biasText = d.bias_label   || '—';
     parts.push(
       '<div class="pre-alert-card">' +
         '<div class="pac-head">' +
           '<span class="pac-icon">' + icon + '</span>' +
           '<span class="pac-title">' + headline + '</span>' +
-          '<span class="pac-dir ' + (isBuy?'buy':'sell') + '">' + (ns.direction||'—') + '</span>' +
+          '<span class="pac-dir ' + (isBuy?'buy':'sell') + '">' + (nsCorrDir||'—') + '</span>' +
         '</div>' +
         '<div class="pac-body">' + context + '</div>' +
         '<div class="pac-action">' + action + '</div>' +
         '<div class="pac-meta">' +
           '<span class="pac-meta-item">Session: ' + sessText + '</span>' +
           '<span class="pac-meta-item">Bias: ' + biasText + '</span>' +
-          (ns.zone_confidence ? '<span class="pac-meta-item">' + (ns.zone_confidence.emoji||'') + ' Zone: ' + ns.zone_confidence.total + '/100</span>' : '') +
         '</div>' +
       '</div>'
     );
   }
+  return parts;
+}
 
+function updatePreAlerts(d) {
+  // Legacy — now called via flushScanUI after all symbols processed
+  const el = document.getElementById('pre-alerts');
+  if (!el) return;
+  const parts = buildPreAlertParts(d, null);
   el.innerHTML = parts.join('');
 }
+
 
 // NEAR-SETUP ALERT (subtle bar, not a full signal card)
 function showNearSetup(symbol, ns, bias) {
@@ -1420,6 +1426,56 @@ function buildInterpretation(sig) {
     ' Price may continue toward ' + target + '. Stop loss is set beyond the sweep wick.';
 }
 
+
+// ── SCAN RENDER BUFFERS ──────────────────────────────────────────────────────
+// Accumulate data from both symbols during scan, then render once after loop.
+let _approachBarData = [];
+let _preAlertData    = [];
+
+function flushScanUI() {
+  // Pick the single best approach bar — highest confidence zone, closest to price
+  const allPz = _approachBarData
+    .filter(d => d.primary_zone)
+    .sort((a, b) => {
+      const scoreA = a.primary_zone?.confidence?.total || 0;
+      const scoreB = b.primary_zone?.confidence?.total || 0;
+      return scoreB - scoreA;
+    });
+  if (allPz.length) {
+    updateApproachBar(allPz[0]);
+  } else {
+    const bar = document.getElementById('approach-bar');
+    if (bar) bar.style.display = 'none';
+  }
+
+  // Render pre-alerts — one card per symbol max, no direction conflicts
+  const el = document.getElementById('pre-alerts');
+  if (!el) { _approachBarData = []; _preAlertData = []; return; }
+
+  const parts = [];
+  const seenDirs = new Set(); // prevent BUY + SELL showing simultaneously
+
+  // Find dominant direction across all active setups
+  const activeDirs = _preAlertData
+    .filter(d => d.near_setup?.direction)
+    .map(d => d.near_setup.direction);
+  // If any confirmed sweep/BOS stage exists, that direction wins
+  const confirmedStages = _preAlertData
+    .filter(d => d.near_setup && ['sweep_detected','displacement_confirmed','structure_break','waiting_pullback','entry_triggered'].includes(d.near_setup.stage));
+  const dominantDir = confirmedStages.length > 0
+    ? confirmedStages[0].near_setup.direction
+    : null;
+
+  _preAlertData.forEach(d => {
+    // Build pre-alert parts for this symbol
+    const symParts = buildPreAlertParts(d, dominantDir);
+    parts.push(...symParts);
+  });
+
+  el.innerHTML = parts.join('');
+  _approachBarData = [];
+  _preAlertData    = [];
+}
 
 // ── SETUP STATUS PANEL ──────────────────────────────────────────────────────
 const STAGE_CONFIG = {
