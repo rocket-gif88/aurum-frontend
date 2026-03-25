@@ -512,11 +512,32 @@ canvas{width:100% !important;display:block;}
           <div style="font-size:11px;color:var(--txt3);padding:4px 0;line-height:1.6">Notifies you when a liquidity grab or strong move is detected — before all conditions are confirmed. Useful for staying prepared.</div>
         </div>
         <div class="acard">
-          <div class="act">TELEGRAM (PREPARED — NOT ACTIVE)</div>
-          <div class="tele-note">System is structured to send alerts to Telegram. Add Bot Token and Chat ID when ready to activate.</div>
-          <div style="margin-top:10px;display:flex;flex-direction:column;gap:6px">
-            <input placeholder="Bot Token" style="background:var(--bg2);border:1px solid var(--line);color:var(--txt3);font-family:var(--mono);font-size:10px;padding:6px 8px;outline:none;width:100%" disabled>
-            <input placeholder="Chat ID" style="background:var(--bg2);border:1px solid var(--line);color:var(--txt3);font-family:var(--mono);font-size:10px;padding:6px 8px;outline:none;width:100%" disabled>
+          <div class="act">TELEGRAM ALERTS</div>
+          <div id="tg-status" style="font-size:10px;color:var(--txt3);margin-bottom:10px;padding:6px 10px;background:var(--bg2);border:1px solid var(--line)">
+            Checking status…
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:10px">
+            <div class="of"><label>BOT TOKEN</label>
+              <input id="tg-token" placeholder="1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ" 
+                style="background:var(--bg2);border:1px solid var(--line);color:var(--txt);font-family:var(--mono);font-size:10px;padding:6px 8px;outline:none;width:100%">
+            </div>
+            <div class="of"><label>CHAT ID</label>
+              <input id="tg-chat" placeholder="123456789"
+                style="background:var(--bg2);border:1px solid var(--line);color:var(--txt);font-family:var(--mono);font-size:10px;padding:6px 8px;outline:none;width:100%">
+            </div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button onclick="saveTelegram()" class="ob" style="flex:1">SAVE & ACTIVATE</button>
+            <button onclick="testTelegram()" class="ob" style="flex:1">SEND TEST</button>
+          </div>
+          <div style="font-size:10px;color:var(--txt3);margin-top:10px;line-height:1.7">
+            <strong style="color:var(--txt2)">Setup (2 min):</strong><br>
+            1. Open Telegram → search <strong>@BotFather</strong><br>
+            2. Send <code style="color:var(--gold)">/newbot</code> → follow steps → copy the <strong>Bot Token</strong><br>
+            3. Start a chat with your new bot → send any message<br>
+            4. Visit: <code style="color:var(--gold)">api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</code><br>
+            5. Copy the <strong>id</strong> number from "chat" → that's your Chat ID<br>
+            6. Paste both above and click Save
           </div>
         </div>
       </div>
@@ -668,6 +689,7 @@ function go(n,el){
   document.getElementById('ptitle').textContent=PT[n]||n;
   if(n==='performance'){calcPerf();setTimeout(drawEq,60);}
   if(n==='history')renderHist();
+  if(n==='alerts')checkTelegramStatus();
 }
 
 // FILTER
@@ -1143,10 +1165,94 @@ function playSound(isBuy, vol=0.25){
 }
 
 // TELEGRAM STUB
-function sendTelegram(sig){
-  if(!prefs.tgToken||!prefs.tgChat) return;
-  const msg=`🔔 ${sig.asset} ${sig.direction}\nEntry: $${sig.entry}\nSL: $${sig.stop_loss}\nTP1: $${sig.take_profit_1} | TP2: $${sig.take_profit_2}\nRR: 1:${sig.rr} | Confidence: ${sig.confidence}%\nSetup: ${sig.reason}\nSession: ${sig.session}`;
-  fetch(`https://api.telegram.org/bot${prefs.tgToken}/sendMessage`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_id:prefs.tgChat,text:msg,parse_mode:'HTML'})}).catch(()=>{});
+// ── TELEGRAM CONFIG ────────────────────────────────────────────
+async function checkTelegramStatus() {
+  const el = document.getElementById('tg-status');
+  if (!el) return;
+  try {
+    const d = await fetch(SRV + '/config').then(r => r.json());
+    if (d.tg_configured) {
+      el.textContent = '✅ Telegram active — signals will be sent automatically';
+      el.style.color  = 'var(--buy)';
+    } else {
+      el.textContent = '○ Not configured — enter your Bot Token and Chat ID below';
+      el.style.color  = 'var(--txt3)';
+    }
+    // Restore saved values to inputs
+    if (prefs.tgToken) document.getElementById('tg-token').value = prefs.tgToken;
+    if (prefs.tgChat)  document.getElementById('tg-chat').value  = prefs.tgChat;
+  } catch(e) {
+    el.textContent = 'Cannot reach server'; el.style.color = 'var(--sell)';
+  }
+}
+
+async function saveTelegram() {
+  const token  = document.getElementById('tg-token')?.value.trim();
+  const chatId = document.getElementById('tg-chat')?.value.trim();
+  if (!token || !chatId) { alert('Enter both Bot Token and Chat ID'); return; }
+  const el = document.getElementById('tg-status');
+  el.textContent = 'Saving…'; el.style.color = 'var(--warn)';
+  try {
+    const d = await fetch(SRV + '/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tg_token: token, tg_chat_id: chatId })
+    }).then(r => r.json());
+    prefs.tgToken = token;
+    prefs.tgChat  = chatId;
+    localStorage.setItem('au4_p', JSON.stringify(prefs));
+    if (d.ok && d.tg_configured) {
+      el.textContent = '✅ Telegram active — test by clicking Send Test';
+      el.style.color  = 'var(--buy)';
+    } else {
+      el.textContent = 'Saved but not confirmed — check your token/chat ID';
+      el.style.color  = 'var(--warn)';
+    }
+  } catch(e) {
+    el.textContent = 'Error: ' + e.message; el.style.color = 'var(--sell)';
+  }
+}
+
+async function testTelegram() {
+  const el = document.getElementById('tg-status');
+  el.textContent = 'Sending test message…'; el.style.color = 'var(--warn)';
+  try {
+    const token  = document.getElementById('tg-token')?.value.trim() || prefs.tgToken;
+    const chatId = document.getElementById('tg-chat')?.value.trim()  || prefs.tgChat;
+    if (!token || !chatId) { alert('Save your Token and Chat ID first'); return; }
+    const msg = '🔔 <b>Aurum Signals — Test Message</b>\n\nYour Telegram alerts are working correctly.\nYou will receive Gold and Silver signals here automatically during London and New York sessions.\n\n─────────────────\nAurum Signals';
+    const resp = await fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: msg, parse_mode: 'HTML' })
+    }).then(r => r.json());
+    if (resp.ok) {
+      el.textContent = '✅ Test message sent! Check your Telegram.';
+      el.style.color  = 'var(--buy)';
+    } else {
+      el.textContent = '✗ Failed: ' + (resp.description || 'check your token/chat ID');
+      el.style.color  = 'var(--sell)';
+    }
+  } catch(e) {
+    el.textContent = 'Error: ' + e.message; el.style.color = 'var(--sell)';
+  }
+}
+
+function sendTelegram(sig) {
+  // Client-side Telegram send (backup — server auto-scan handles primary alerts)
+  if (!prefs.tgToken || !prefs.tgChat) return;
+  const alert = sig.alert || {};
+  const msg = '🔔 <b>' + sig.asset + ' ' + sig.direction + '</b>\n' +
+    (alert.context || sig.reason || '') + '\n\n' +
+    '• Entry: $' + sig.entry + '\n' +
+    '• Stop: $' + sig.stop_loss + '\n' +
+    '• Target 1: $' + sig.take_profit_1 + ' | Target 2: $' + sig.take_profit_2 + '\n' +
+    '• R:R 1:' + sig.rr + ' | Confidence: ' + sig.confidence + '%\n' +
+    '• Session: ' + (sig.session || '—');
+  fetch('https://api.telegram.org/bot' + prefs.tgToken + '/sendMessage', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ chat_id: prefs.tgChat, text: msg, parse_mode: 'HTML' })
+  }).catch(() => {});
 }
 
 // REASON BUILDER — converts technical reason to readable explanation
