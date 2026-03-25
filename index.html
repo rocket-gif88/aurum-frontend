@@ -303,6 +303,12 @@ canvas{width:100% !important;display:block;}
 .ac-remove:hover{color:var(--sell);}
 /* Pre-signal card */
 .pre-alert-card{border-left:3px solid var(--state-approach);background:rgba(255,152,0,.04);padding:12px 16px;border-bottom:1px solid var(--line2);}
+/* Zone confidence badge */
+.conf-badge{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:9px;padding:2px 7px;border:1px solid;letter-spacing:.04em;margin-top:5px;}
+.conf-badge.high{color:var(--buy);border-color:var(--buybdr);}
+.conf-badge.medium{color:var(--warn);border-color:rgba(200,144,26,.3);}
+.conf-badge.low{color:var(--sell);border-color:var(--sellbdr);}
+.conf-badge.ignore{color:var(--txt3);border-color:var(--line);}
 .pac-head{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
 .pac-icon{font-size:14px;flex-shrink:0;}
 .pac-title{font-family:var(--mono);font-size:10px;font-weight:600;color:#e69500;letter-spacing:.04em;}
@@ -981,22 +987,39 @@ function updatePanel(id,d){
   }
   const lvlEl = document.getElementById(`sp-${id}-lvls`);
   if(d.levels?.length){
-    lvlEl.innerHTML = d.levels.map(l=>{
-      const sColor = l.strength==='strong'?'var(--buy)':l.strength==='medium'?'var(--warn)':'var(--txt3)';
-      const sDot   = '<span style="width:5px;height:5px;border-radius:50%;background:'+sColor+';display:inline-block;margin-right:4px;flex-shrink:0;vertical-align:middle" title="'+l.strength+' zone"></span>';
-      const typeLabels = {'PDH':'Prior High','PDL':'Prior Low','ASH':'Asia High','ASL':'Asia Low','EQH':'Sell Zone','EQL':'Buy Zone'};
-      const typeLabel  = typeLabels[l.type] || l.type;
+    // Mark primary zone from scan result
+    const pzId = d.primary_zone
+      ? (Math.round(d.primary_zone.minPrice) + '-' + Math.round(d.primary_zone.maxPrice))
+      : null;
 
+    lvlEl.innerHTML = d.levels.map(l=>{
       if (l.isZone) {
-        // Render as a zone band
-        const zDir     = l.zoneType === 'sell_zone' ? 'var(--sell)' : 'var(--buy)';
-        const rangeStr = '$' + parseFloat(l.minPrice).toFixed(2) + ' – $' + parseFloat(l.maxPrice).toFixed(2);
-        return '<div class="lvl-item" style="border-left:2px solid '+zDir+';padding-left:6px" title="'+l.totalTouches+' liquidity touches clustered into one zone">'+
-          '<span class="lvl-type" style="color:'+zDir+'">'+typeLabel+'</span>'+
-          '<span class="lvl-name">'+sDot+rangeStr+'</span>'+
+        const zDir       = l.type === 'EQH' ? 'var(--sell)' : 'var(--buy)';
+        const zDir2      = l.type === 'EQH' ? 'SELL' : 'BUY';
+        const rangeStr   = '$' + parseFloat(l.minPrice).toFixed(2) + '–$' + parseFloat(l.maxPrice).toFixed(2);
+        const zoneKey    = Math.round(l.minPrice) + '-' + Math.round(l.maxPrice);
+        const isPrimary  = pzId && pzId === zoneKey;
+        const opacity    = isPrimary ? '1' : '0.4'; // dim secondary zones
+        // Confidence badge for primary zone
+        const pzConf   = d.zone_confidence || (isPrimary && d.primary_zone?.confidence?.total);
+        const pzGrade  = isPrimary && d.primary_zone?.confidence?.grade;
+        const confMap  = { HIGH:'🟢', MEDIUM:'🟡', LOW:'🔴', IGNORE:'⚫' };
+        const confEmoji= confMap[pzGrade] || '';
+        const badge    = isPrimary
+          ? '<span style="font-family:var(--mono);font-size:7px;padding:1px 5px;background:'+zDir+';color:#fff;margin-left:4px;letter-spacing:.04em">PRIMARY</span>' +
+            (pzGrade ? '<span style="font-family:var(--mono);font-size:7px;margin-left:4px;color:var(--txt3)">' + confEmoji + ' ' + pzGrade + '</span>' : '')
+          : '';
+        return '<div class="lvl-item" style="opacity:'+opacity+';border-left:2px solid '+zDir+';padding-left:6px" title="'+l.totalTouches+' touches — '+zDir2+' zone">'+
+          '<span class="lvl-type" style="color:'+zDir+'">'+zDir2+' ZONE</span>'+
+          '<span class="lvl-name">'+rangeStr+badge+'</span>'+
           '<span class="lvl-p" style="font-size:9px;color:var(--txt3)">×'+l.totalTouches+'</span>'+
         '</div>';
       }
+      // Single levels (PDH/PDL/ASH/ASL)
+      const sColor = l.strength==='strong'?'var(--buy)':l.strength==='medium'?'var(--warn)':'var(--txt3)';
+      const sDot   = '<span style="width:5px;height:5px;border-radius:50%;background:'+sColor+';display:inline-block;margin-right:4px;flex-shrink:0;vertical-align:middle"></span>';
+      const typeLabels = {'PDH':'Prior High','PDL':'Prior Low','ASH':'Asia High','ASL':'Asia Low'};
+      const typeLabel  = typeLabels[l.type] || l.type;
       return '<div class="lvl-item" title="'+l.label+'">'+
         '<span class="lvl-type">'+typeLabel+'</span>'+
         '<span class="lvl-name">'+sDot+l.label+'</span>'+
@@ -1053,37 +1076,30 @@ function processSignal(sig){
 function updateApproachBar(d) {
   const bar = document.getElementById('approach-bar');
   if (!bar) return;
-  if (!d.approaching_levels || !d.approaching_levels.length) {
-    bar.style.display = 'none'; return;
-  }
+
+  // Use primary_zone if available — single clean source of truth
+  const pz = d.primary_zone;
+  if (!pz) { bar.style.display = 'none'; return; }
+
   bar.style.display = 'block';
-
-  // Show only the single closest level/zone — no stacking
-  const closest   = d.approaching_levels[0];
-  const isBuy     = closest.side === 'below';
   const assetName = d.symbol === 'XAUUSD' ? 'Gold' : 'Silver';
+  const dir       = pz.direction || (pz.type === 'EQH' ? 'SELL' : 'BUY');
+  const isBuy     = dir === 'BUY';
   const dirColor  = isBuy ? 'var(--buy)' : 'var(--sell)';
-  const dirLabel  = isBuy ? 'BUY ZONE' : 'SELL ZONE';
-
-  // Build zone description
-  let zoneDesc;
-  if (closest.isZone) {
-    const lo = parseFloat(closest.minPrice).toFixed(2);
-    const hi = parseFloat(closest.maxPrice).toFixed(2);
-    zoneDesc = assetName + ' approaching <strong>' + dirLabel + ' $' + lo + '–$' + hi +
-      ' (' + closest.totalTouches + ' touches)</strong> — ' + closest.distPct + '% away';
-  } else {
-    const typeLabel = {'PDH':'Prior Day High','PDL':'Prior Day Low',
-      'ASH':'Asia Session High','ASL':'Asia Session Low'}[closest.type] || closest.label;
-    zoneDesc = assetName + ' approaching <strong>' + typeLabel + '</strong> at $' +
-      parseFloat(closest.price).toFixed(3) + ' (' + closest.distPct + '% away)';
-  }
+  const lo        = parseFloat(pz.minPrice).toFixed(2);
+  const hi        = parseFloat(pz.maxPrice).toFixed(2);
+  const distTxt   = pz.distPct !== undefined ? pz.distPct + '% away' : '';
 
   bar.innerHTML =
     '<div class="approach-bar">' +
     '<div class="ab-dot"></div>' +
-    '<span class="ab-dir" style="color:' + dirColor + '">' + dirLabel + '</span>' +
-    '<span>' + zoneDesc + ' — watch for sweep and reversal</span>' +
+    '<span class="ab-dir" style="color:' + dirColor + '">PRIMARY ' + dir + ' ZONE</span>' +
+    '<span>' + assetName + ': <strong>$' + lo + '–$' + hi + '</strong>' +
+    ' (' + pz.totalTouches + ' touches)' +
+    (distTxt ? ' — ' + distTxt : '') +
+    '</span>' +
+    (pz.confidence ? '<span style="margin-left:8px;font-family:var(--mono);font-size:9px;color:var(--txt3)">' +
+      (pz.confidence.emoji || '') + ' Confidence: ' + pz.confidence.total + '/100</span>' : '') +
     '</div>';
 }
 
@@ -1095,19 +1111,16 @@ function updatePreAlerts(d) {
 
   // Sweep potential alerts
   if (d.sweep_potentials && d.sweep_potentials.length) {
-    // Deduplicate sweep potentials — show only closest unique zone
-    const seenZones = new Set();
-    d.sweep_potentials.filter(sp => {
-      const zoneId = sp.level && sp.level.isZone
-        ? Math.round(sp.level.minPrice) + '-' + Math.round(sp.level.maxPrice)
-        : sp.level ? Math.round(sp.level.price) : 'none';
-      if (seenZones.has(zoneId)) return false;
-      seenZones.add(zoneId); return true;
-    }).slice(0, 1).forEach(sp => {  // max 1 sweep potential card
-      const isBuy = sp.direction === 'BUY';
-      const aName = d.symbol === 'XAUUSD' ? 'GOLD' : 'SILVER';
-      const zoneTitle = sp.level && sp.level.isZone
-        ? aName + ' — ' + (isBuy ? 'BUY' : 'SELL') + ' ZONE NEARBY'
+    // Show max 1 sweep potential card — from primary zone only
+    const spList = (d.primary_zone && d.sweep_potentials && d.sweep_potentials.length)
+      ? d.sweep_potentials.slice(0, 1)
+      : [];
+    spList.forEach(sp => {
+      const isBuy  = sp.direction === 'BUY';
+      const aName  = d.symbol === 'XAUUSD' ? 'GOLD' : 'SILVER';
+      const pz2    = d.primary_zone;
+      const zoneTitle = pz2
+        ? aName + ' — PRIMARY ' + sp.direction + ' ZONE'
         : aName + ' — KEY LEVEL NEARBY';
       parts.push(
         '<div class="pre-alert-card">' +
@@ -1117,7 +1130,9 @@ function updatePreAlerts(d) {
             '<span class="pac-dir ' + (isBuy?'buy':'sell') + '">' + sp.direction + '</span>' +
           '</div>' +
           '<div class="pac-body">' + sp.message + '</div>' +
-          '<div class="pac-action">No trade yet. Monitor for a sweep through this level and reversal.</div>' +
+          '<div class="pac-action">No trade yet. Monitor for a sweep through this zone and reversal.</div>' +
+          (d.primary_zone && d.primary_zone.confidence ? '<div class="conf-badge ' + (d.primary_zone.confidence.grade||'').toLowerCase() + '" style="margin-top:4px">' +
+            (d.primary_zone.confidence.emoji||'') + ' Zone confidence: ' + d.primary_zone.confidence.total + '/100 — ' + (d.primary_zone.confidence.grade||'') + '</div>' : '') +
         '</div>'
       );
     });
@@ -1155,6 +1170,7 @@ function updatePreAlerts(d) {
         '<div class="pac-meta">' +
           '<span class="pac-meta-item">Session: ' + sessText + '</span>' +
           '<span class="pac-meta-item">Bias: ' + biasText + '</span>' +
+          (ns.zone_confidence ? '<span class="pac-meta-item">' + (ns.zone_confidence.emoji||'') + ' Zone: ' + ns.zone_confidence.total + '/100</span>' : '') +
         '</div>' +
       '</div>'
     );
