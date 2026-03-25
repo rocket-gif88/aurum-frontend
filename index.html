@@ -227,6 +227,43 @@ canvas{width:100% !important;display:block;}
 .rt{font-size:11px;color:var(--txt2);line-height:1.6;}
 .disc{padding:12px;background:rgba(200,144,26,.05);border:1px solid rgba(200,144,26,.2);margin-top:14px;}
 
+/* ── SETUP STATUS PANEL ────────────── */
+.setup-status{border-bottom:1px solid var(--line2);}
+.ss-idle{padding:32px 20px;text-align:center;}
+.ss-idle-title{font-family:var(--mono);font-size:11px;color:var(--txt3);margin-bottom:8px;letter-spacing:.1em;}
+.ss-idle-sub{font-size:11px;color:var(--txt3);line-height:1.8;max-width:340px;margin:0 auto;}
+.ss-active{padding:16px 20px;}
+.ss-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;}
+.ss-title{font-family:var(--mono);font-size:8px;color:var(--txt3);letter-spacing:.12em;text-transform:uppercase;}
+.ss-action{font-family:var(--mono);font-size:10px;font-weight:600;padding:3px 10px;border:1px solid;letter-spacing:.08em;}
+.ss-action.wait{color:var(--txt3);border-color:var(--line);}
+.ss-action.monitor{color:var(--warn);border-color:rgba(200,144,26,.35);}
+.ss-action.prepare{color:var(--buy);border-color:var(--buybdr);}
+.ss-action.execute{color:#fff;background:var(--buy);border-color:var(--buy);animation:pulse-dot 1.5s infinite;}
+.ss-action.execute.sell{background:var(--sell);border-color:var(--sell);}
+.ss-dir-badge{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid;font-family:var(--mono);font-size:10px;font-weight:600;margin-bottom:10px;}
+.ss-dir-badge.buy{color:var(--buy);border-color:var(--buybdr);background:var(--buybg);}
+.ss-dir-badge.sell{color:var(--sell);border-color:var(--sellbdr);background:var(--sellbg);}
+.ss-dir-badge.forming{color:var(--txt3);border-color:var(--line);}
+.ss-pipeline{display:flex;margin-bottom:12px;}
+.ss-step{flex:1;padding:8px 4px;text-align:center;position:relative;}
+.ss-step::after{content:'→';position:absolute;right:-4px;top:50%;transform:translateY(-50%);font-size:9px;color:var(--txt3);}
+.ss-step:last-child::after{display:none;}
+.ss-step-dot{width:6px;height:6px;border-radius:50%;margin:0 auto 5px;background:var(--txt3);}
+.ss-step-label{font-family:var(--mono);font-size:8px;color:var(--txt3);letter-spacing:.03em;}
+.ss-step.done .ss-step-dot{background:var(--buy);}
+.ss-step.done .ss-step-label{color:var(--txt2);}
+.ss-step.current .ss-step-dot{background:var(--warn);width:9px;height:9px;margin-top:-1px;animation:pulse-dot 1.2s infinite;}
+.ss-step.current .ss-step-label{color:var(--warn);font-weight:600;}
+.ss-step.current.dir-sell .ss-step-dot{background:var(--sell);}
+.ss-step.current.dir-sell .ss-step-label{color:var(--sell);}
+.ss-step.current.dir-entry .ss-step-dot{background:var(--buy);}
+.ss-step.current.dir-entry .ss-step-label{color:var(--buy);}
+.ss-desc{padding:10px 14px;background:var(--bg2);border:1px solid var(--line2);}
+.ss-desc-stage{font-family:var(--mono);font-size:8px;color:var(--txt3);letter-spacing:.08em;margin-bottom:4px;text-transform:uppercase;}
+.ss-desc-text{font-size:11px;color:var(--txt2);line-height:1.6;}
+.ss-desc-next{font-size:10px;color:var(--txt3);font-style:italic;margin-top:5px;}
+
 /* ── STRUCTURED ALERT CARD ─────────────────────────────────────── */
 .alert-card{position:relative;padding:0;border:1px solid var(--line);overflow:hidden;transition:background .15s;}
 .alert-card.buy-c{border-left:4px solid var(--buy);}
@@ -411,10 +448,14 @@ canvas{width:100% !important;display:block;}
               </button>
             </div>
           </div>
-          <div id="feed">
-            <div class="empty"><div class="empty-h">No signals generated yet</div>
-            <div class="empty-p">Click <strong style="color:var(--gold)">SCAN MARKETS</strong> to analyse current conditions for Gold and Silver.<br><br>A signal is only generated when all conditions are confirmed:<br>Liquidity grab → Strong move → Trend shift → Pullback entry<br>with Risk/Reward ≥ 1:2 and Confidence ≥ 80%</div></div>
+          <div class="setup-status" id="setup-status">
+            <div class="ss-idle"><div class="ss-idle-title">WATCHING THE MARKET</div>
+            <div class="ss-idle-sub">Click <strong style="color:var(--gold)">SCAN MARKETS</strong> to begin.<br><br>When a setup forms, this panel guides you through each stage in real time.</div></div>
           </div>
+          <div id="feed-header" style="display:none;padding:9px 20px;border-bottom:1px solid var(--line2);background:var(--bg1);">
+            <span style="font-family:var(--mono);font-size:8px;color:var(--txt3);letter-spacing:.1em">CONFIRMED SIGNALS</span>
+          </div>
+          <div id="feed"></div>
         </div>
         <div class="sig-side">
           <div class="sh" style="background:var(--bg1)"><span class="st">Market Conditions</span></div>
@@ -690,6 +731,7 @@ function go(n,el){
   if(n==='performance'){calcPerf();setTimeout(drawEq,60);}
   if(n==='history')renderHist();
   if(n==='alerts')checkTelegramStatus();
+  if(n==='signals')renderSetupStatus();
 }
 
 // FILTER
@@ -852,8 +894,9 @@ async function scan(btn){
       }
       // Update side panel
       updatePanel(sid, d);
-      // Pipeline
+      // Pipeline + Setup Status Panel
       updatePipeline(sid, d.setup_state||'idle');
+      updateSetupStatus(d.symbol, d);
       // Log
       if (d.log) d.log.forEach(l => {
         const isOk   = l.startsWith('✅') || l.includes('Signal generated') || l.includes('candles');
@@ -871,7 +914,7 @@ async function scan(btn){
         processSignal(d.signal);
       }
     });
-    logEl.innerHTML = logLines.join('<br>') || '<span style="color:var(--txt3)">Analysis complete. No valid setups detected in current conditions.</span>';
+    logEl.innerHTML = logLines.join('<br>') || '<span style="color:var(--txt3)">Scan complete — see Setup Status panel above for current stage.</span>';
 
   } catch(e) {
     console.error('Scan error:', e);
@@ -1283,6 +1326,97 @@ function buildInterpretation(sig) {
     ' Price may continue toward ' + target + '. Stop loss is set beyond the sweep wick.';
 }
 
+
+// ── SETUP STATUS PANEL ──────────────────────────────────────────────────────
+const STAGE_CONFIG = {
+  idle:                   { label:'Watching the market',         desc:'No active setup. Monitoring for liquidity opportunities.',                                                                               next:'Waiting for price to approach a key level.',                                 action:'wait',    actionLabel:'WAIT'    },
+  approaching_liquidity:  { label:'Approaching key level',       desc:'Price is nearing a significant liquidity level. A sweep and reversal could begin a new setup.',                                          next:'Watch for a liquidity grab (price sweeps the level and closes back inside).',  action:'monitor', actionLabel:'MONITOR' },
+  sweep_detected:         { label:'Liquidity grab detected',     desc:'Price swept beyond a key level and closed back inside. A potential reversal setup has begun.',                                            next:'Waiting for a strong displacement candle to confirm momentum.',               action:'monitor', actionLabel:'MONITOR' },
+  displacement_confirmed: { label:'Strong move confirmed',       desc:'A strong directional candle followed the liquidity grab, confirming momentum is building.',                                               next:'Waiting for a trend shift (break of structure) to validate direction.',        action:'monitor', actionLabel:'MONITOR' },
+  structure_break:        { label:'Trend shift confirmed',       desc:'Market structure has shifted in the direction of the setup. The move is now structurally valid.',                                         next:'Waiting for price to pull back into the 50–61.8% entry zone.',                action:'prepare', actionLabel:'PREPARE' },
+  waiting_pullback:       { label:'Waiting for pullback entry',  desc:'All structure conditions are confirmed. Price needs to retrace into the entry zone before triggering.',                                   next:'Watch for price to enter the zone and print a rejection candle.',             action:'prepare', actionLabel:'PREPARE' },
+  entry_triggered:        { label:'Entry zone reached',          desc:'All conditions confirmed. A full signal has been generated with entry, stop loss, and targets.',                                          next:'Review the signal card below. Wait for the entry zone — do not chase price.', action:'execute', actionLabel:'EXECUTE' },
+  invalidated:            { label:'Setup no longer valid',       desc:'The setup was invalidated — pullback exceeded 70%, time expired, or structure broke against direction.',                                   next:'Watching for a fresh setup to begin.',                                       action:'wait',    actionLabel:'WAIT'    },
+  standby:                { label:'Loading market data',         desc:'Collecting enough candle data to begin analysis.',                                                                                        next:null,                                                                         action:'wait',    actionLabel:'WAIT'    }
+};
+const STAGE_ORDER = ['idle','approaching_liquidity','sweep_detected','displacement_confirmed','structure_break','waiting_pullback','entry_triggered'];
+let currentSetupState = { xau:{ state:'idle' }, xag:{ state:'idle' } };
+
+function updateSetupStatus(sym, d) {
+  const id = sym === 'XAUUSD' ? 'xau' : 'xag';
+  currentSetupState[id] = {
+    state:     d.setup_state || 'idle',
+    direction: d.near_setup?.direction || d.signal?.direction || null,
+    symbol:    sym,
+    near_setup:d.near_setup,
+    signal:    d.signal,
+    session:   d.session,
+    price:     d.price
+  };
+  renderSetupStatus();
+}
+
+function renderSetupStatus() {
+  const panel = document.getElementById('setup-status');
+  if (!panel) return;
+
+  const candidates = [currentSetupState.xau, currentSetupState.xag]
+    .filter(s => s.state && s.state !== 'idle' && s.state !== 'standby' && s.state !== 'invalidated');
+
+  if (!candidates.length) {
+    panel.innerHTML = '<div class="ss-idle"><div class="ss-idle-title">WATCHING THE MARKET</div>' +
+      '<div class="ss-idle-sub">The engine is monitoring Gold and Silver for liquidity opportunities during the active session.<br><br>' +
+      'When a setup begins forming, this panel will guide you through each stage in real time.</div></div>';
+    return;
+  }
+
+  // Primary = highest stage
+  candidates.sort((a,b) => STAGE_ORDER.indexOf(b.state) - STAGE_ORDER.indexOf(a.state));
+  const primary   = candidates[0];
+  const cfg       = STAGE_CONFIG[primary.state] || STAGE_CONFIG.idle;
+  const isBuy     = primary.direction === 'BUY';
+  const isSell    = primary.direction === 'SELL';
+  const assetName = primary.symbol === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const isEntry   = primary.state === 'entry_triggered';
+
+  // Pipeline
+  const steps = [
+    { key:'sweep_detected',         short:'Grab'     },
+    { key:'displacement_confirmed', short:'Move'     },
+    { key:'structure_break',        short:'Shift'    },
+    { key:'waiting_pullback',       short:'Pullback' },
+    { key:'entry_triggered',        short:'Entry'    }
+  ];
+  const curIdx = STAGE_ORDER.indexOf(primary.state);
+  const pipelineHTML = steps.map(step => {
+    const sIdx = STAGE_ORDER.indexOf(step.key);
+    const done = sIdx < curIdx;
+    const cur  = step.key === primary.state;
+    let cls = done ? 'done' : '';
+    if (cur) cls = 'current' + (isSell ? ' dir-sell' : '') + (isEntry ? ' dir-entry' : '');
+    return '<div class="ss-step ' + cls + '"><div class="ss-step-dot"></div><div class="ss-step-label">' + step.short + '</div></div>';
+  }).join('');
+
+  const dirCls = isBuy ? 'buy' : isSell ? 'sell' : 'forming';
+  const dirTxt = primary.direction ? ('▲'.replace('▲', isBuy?'▲':'▼') + ' ' + assetName + ' ' + primary.direction) : (assetName + ' — DIRECTION FORMING');
+  const actCls = cfg.action + (isEntry && isSell ? ' sell' : '');
+
+  panel.innerHTML =
+    '<div class="ss-active">' +
+      '<div class="ss-header">' +
+        '<span class="ss-title">SETUP IN PROGRESS</span>' +
+        '<span class="ss-action ' + actCls + '">ACTION: ' + cfg.actionLabel + '</span>' +
+      '</div>' +
+      '<div class="ss-dir-badge ' + dirCls + '">' + dirTxt + '</div>' +
+      '<div class="ss-pipeline">' + pipelineHTML + '</div>' +
+      '<div class="ss-desc">' +
+        '<div class="ss-desc-stage">' + cfg.label.toUpperCase() + '</div>' +
+        '<div class="ss-desc-text">' + cfg.desc + '</div>' +
+        (cfg.next ? '<div class="ss-desc-next">→ ' + cfg.next + '</div>' : '') +
+      '</div>' +
+    '</div>';
+}
+
 // RENDER FEED
 function renderFeed(){
   const feed = document.getElementById('feed');
@@ -1295,9 +1429,11 @@ function renderFeed(){
   document.getElementById('sig-ct').textContent = list.length + ' signal' + (list.length !== 1 ? 's' : '');
 
   if (!list.length) {
-    feed.innerHTML = '<div class="empty"><div class="empty-h">No valid setups right now</div><div class="empty-p">The system is watching for a clean liquidity grab followed by a strong directional move and trend confirmation.<br><br>Adjust filters or click <strong style=\"color:var(--gold)\">SCAN MARKETS</strong> to check current conditions.</div></div>';
+    feed.innerHTML = '';
+    const fh = document.getElementById('feed-header'); if(fh) fh.style.display='none';
     return;
   }
+  const fh2 = document.getElementById('feed-header'); if(fh2) fh2.style.display='block';
 
   feed.innerHTML = list.map(sig => {
     const isBuy      = sig.direction === 'BUY';
@@ -1519,7 +1655,7 @@ function toggleAuto(){
 }
 
 // INIT
-loadPr(); renderFeed(); renderHist(); calcPerf(); setTimeout(drawEq,100);
+loadPr(); renderFeed(); renderHist(); calcPerf(); setTimeout(drawEq,100); renderSetupStatus();
 window.addEventListener('resize',drawEq);
 if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
 </script>
