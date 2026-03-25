@@ -889,8 +889,17 @@ async function scan(btn){
       }
       if (sysState === 'data_error') {
         logLines.push('<span class="log-line err">['+d.symbol+'] '+(d.log[0]||'Data unavailable')+'</span>');
-        logLines.push('<span style="color:var(--txt3);font-size:9px">['+d.symbol+'] → Click DEBUG button to test API connection directly</span>');
+        logLines.push('<span style="color:var(--txt3);font-size:9px">['+d.symbol+'] → Click DEBUG to test API connection</span>');
         updatePipeline(sid, 'standby');
+        return;
+      }
+      if (sysState === 'session_closed') {
+        const isSlv = d.symbol === 'XAGUSD';
+        const closedMsg = isSlv
+          ? '[' + d.symbol + '] Silver market closed — SLV trades 13:30–20:00 UTC'
+          : '[' + d.symbol + '] Outside trading session';
+        logLines.push('<span style="color:var(--txt3)">' + closedMsg + '</span>');
+        updatePipeline(sid, 'idle');
         return;
       }
       if (d.setup_state === 'standby') {
@@ -969,13 +978,16 @@ function updatePanel(id,d){
   sessEl.style.color = d.session_ok?'var(--warn)':'var(--txt3)';
   const biasEl = document.getElementById(`sp-${id}-bias`);
   if(biasEl){
-    const biasMap={
-      'bullish_bias':'↑ Bullish — price below prior day low, favouring long setups',
-      'bearish_bias':'↓ Bearish — price above prior day high, favouring short setups',
-      'neutral':     'Neutral — price within prior day range'
+    // Use unified bias_label from server (weighted score) when available
+    const biasLabel = d.bias_label || 'NEUTRAL';
+    const biasScore = typeof d.bias_score === 'number' ? d.bias_score.toFixed(1) : '0';
+    const biasMap = {
+      'bullish_bias': '↑ BUY bias (' + biasScore + ') — bullish context',
+      'bearish_bias': '↓ SELL bias (' + biasScore + ') — bearish context',
+      'neutral':      'Neutral — no strong directional lean'
     };
-    biasEl.textContent = biasMap[d.directional_bias]||'Neutral';
-    biasEl.style.color = d.directional_bias==='bullish_bias'?'var(--buy)':d.directional_bias==='bearish_bias'?'var(--sell)':'var(--txt3)';
+    biasEl.textContent = biasMap[d.directional_bias] || ('Neutral (score ' + biasScore + ')');
+    biasEl.style.color = biasLabel==='BUY'?'var(--buy)':biasLabel==='SELL'?'var(--sell)':'var(--txt3)';
   }
 
   // Approach bar + pre-alerts (anticipatory)
@@ -1083,7 +1095,10 @@ function updateApproachBar(d) {
 
   bar.style.display = 'block';
   const assetName = d.symbol === 'XAUUSD' ? 'Gold' : 'Silver';
-  const dir       = pz.direction || (pz.type === 'EQH' ? 'SELL' : 'BUY');
+  // Always derive direction from zone type — geometry-based direction can be wrong
+  const dir = (pz.type === 'EQH' || pz.type === 'PDH' || pz.type === 'ASH') ? 'SELL'
+            : (pz.type === 'EQL' || pz.type === 'PDL' || pz.type === 'ASL') ? 'BUY'
+            : (pz.direction || 'BUY');
   const isBuy     = dir === 'BUY';
   const dirColor  = isBuy ? 'var(--buy)' : 'var(--sell)';
   const lo        = parseFloat(pz.minPrice).toFixed(2);
@@ -1109,18 +1124,35 @@ function updatePreAlerts(d) {
   if (!el) return;
   const parts = [];
 
-  // Sweep potential alerts
-  if (d.sweep_potentials && d.sweep_potentials.length) {
+  // Suppress conflicting directions — if an active setup has confirmed direction,
+  // do not show approach cards in the opposite direction
+  const confirmedDir = d.near_setup?.direction || null;
+  // Sweep potential alerts — only show if there is NO near_setup already
+  // (near_setup is more informative and supersedes the approach card)
+  const hasNearSetup = !!(d.near_setup && d.near_setup.stage !== 'approaching_liquidity');
+  if (d.sweep_potentials && d.sweep_potentials.length && !hasNearSetup) {
     // Show max 1 sweep potential card — from primary zone only
     const spList = (d.primary_zone && d.sweep_potentials && d.sweep_potentials.length)
-      ? d.sweep_potentials.slice(0, 1)
+      ? d.sweep_potentials.filter(sp => {
+          // Drop cards that conflict with confirmed setup direction
+          if (!confirmedDir) return true;
+          const spDir = (sp.level?.type === 'EQH' || sp.level?.type === 'PDH') ? 'SELL'
+                      : (sp.level?.type === 'EQL' || sp.level?.type === 'PDL') ? 'BUY'
+                      : sp.direction;
+          return spDir === confirmedDir;
+        }).slice(0, 1)
       : [];
     spList.forEach(sp => {
-      const isBuy  = sp.direction === 'BUY';
+      // Derive direction from zone type — never trust geometry-based direction
+      const lvlType2 = sp.level?.type || '';
+      const corrDir  = (lvlType2 === 'EQH' || lvlType2 === 'PDH' || lvlType2 === 'ASH') ? 'SELL'
+                     : (lvlType2 === 'EQL' || lvlType2 === 'PDL' || lvlType2 === 'ASL') ? 'BUY'
+                     : sp.direction;
+      const isBuy  = corrDir === 'BUY';
       const aName  = d.symbol === 'XAUUSD' ? 'GOLD' : 'SILVER';
       const pz2    = d.primary_zone;
       const zoneTitle = pz2
-        ? aName + ' — PRIMARY ' + sp.direction + ' ZONE'
+        ? aName + ' — PRIMARY ' + corrDir + ' ZONE'
         : aName + ' — KEY LEVEL NEARBY';
       parts.push(
         '<div class="pre-alert-card">' +
@@ -1142,7 +1174,12 @@ function updatePreAlerts(d) {
   if (d.near_setup) {
     const ns      = d.near_setup;
     const alert   = ns.alert || {};
-    const isBuy   = ns.direction === 'BUY';
+    // Derive direction from level type if available
+    const nsLvlType = ns.level?.type || '';
+    const nsCorrDir = (nsLvlType === 'EQH' || nsLvlType === 'PDH' || nsLvlType === 'ASH') ? 'SELL'
+                    : (nsLvlType === 'EQL' || nsLvlType === 'PDL' || nsLvlType === 'ASL') ? 'BUY'
+                    : ns.direction;
+    const isBuy   = nsCorrDir === 'BUY';
     const aName   = d.symbol === 'XAUUSD' ? 'GOLD' : 'SILVER';
     const icons   = { approaching_liquidity:'📍', sweep_detected:'⚡', displacement_confirmed:'↗', structure_break:'✅' };
     const icon    = icons[ns.stage] || '📡';
