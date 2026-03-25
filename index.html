@@ -467,7 +467,7 @@ canvas{width:100% !important;display:block;}
             <div class="sp-row"><span class="sp-lbl">Current stage</span><span class="sp-val" id="sp-xau-st" style="font-size:9px;color:var(--txt3)">—</span></div>
             <div class="sp-row"><span class="sp-lbl" title="London: 07:00-16:00 UTC · New York: 13:00-22:00 UTC">Active session</span><span class="sp-val" id="sp-xau-sess" style="font-size:9px">—</span></div>
               <div class="sp-row"><span class="sp-lbl" title="Directional lean based on price position relative to Prior Day High/Low">Market bias</span><span class="sp-val" id="sp-xau-bias" style="font-size:9px;color:var(--txt3)">—</span></div>
-            <div style="font-family:var(--mono);font-size:8px;color:var(--txt3);margin-top:8px;letter-spacing:.06em;margin-bottom:4px" title="Key price zones where stop orders are likely clustered">KEY PRICE LEVELS</div>
+            <div style="font-family:var(--mono);font-size:8px;color:var(--txt3);margin-top:8px;letter-spacing:.06em;margin-bottom:4px" title="Clustered liquidity zones — equal highs/lows grouped into unified areas">LIQUIDITY ZONES</div>
             <div id="sp-xau-lvls"></div>
           </div>
           <div class="sp">
@@ -478,7 +478,7 @@ canvas{width:100% !important;display:block;}
             <div class="sp-row"><span class="sp-lbl">Current stage</span><span class="sp-val" id="sp-xag-st" style="font-size:9px;color:var(--txt3)">—</span></div>
             <div class="sp-row"><span class="sp-lbl" title="London: 07:00-16:00 UTC · New York: 13:00-22:00 UTC">Active session</span><span class="sp-val" id="sp-xag-sess" style="font-size:9px">—</span></div>
               <div class="sp-row"><span class="sp-lbl" title="Directional lean based on price position relative to Prior Day High/Low">Market bias</span><span class="sp-val" id="sp-xag-bias" style="font-size:9px;color:var(--txt3)">—</span></div>
-            <div style="font-family:var(--mono);font-size:8px;color:var(--txt3);margin-top:8px;letter-spacing:.06em;margin-bottom:4px" title="Key price zones where stop orders are likely clustered">KEY PRICE LEVELS</div>
+            <div style="font-family:var(--mono);font-size:8px;color:var(--txt3);margin-top:8px;letter-spacing:.06em;margin-bottom:4px" title="Clustered liquidity zones — equal highs/lows grouped into unified areas">LIQUIDITY ZONES</div>
             <div id="sp-xag-lvls"></div>
           </div>
           <div class="sp">
@@ -983,12 +983,21 @@ function updatePanel(id,d){
   if(d.levels?.length){
     lvlEl.innerHTML = d.levels.map(l=>{
       const sColor = l.strength==='strong'?'var(--buy)':l.strength==='medium'?'var(--warn)':'var(--txt3)';
-      const sDot   = l.strength ? '<span style="width:5px;height:5px;border-radius:50%;background:'+sColor+';display:inline-block;margin-right:4px;flex-shrink:0" title="'+l.strength+' liquidity zone"></span>' : '';
-      const typeLabel = {
-        'PDH':'Prior High','PDL':'Prior Low','ASH':'Asia High','ASL':'Asia Low',
-        'EQH':'Equal Highs','EQL':'Equal Lows'
-      }[l.type] || l.type;
-      return '<div class="lvl-item" title="'+l.label+' — '+l.type+'">'+
+      const sDot   = '<span style="width:5px;height:5px;border-radius:50%;background:'+sColor+';display:inline-block;margin-right:4px;flex-shrink:0;vertical-align:middle" title="'+l.strength+' zone"></span>';
+      const typeLabels = {'PDH':'Prior High','PDL':'Prior Low','ASH':'Asia High','ASL':'Asia Low','EQH':'Sell Zone','EQL':'Buy Zone'};
+      const typeLabel  = typeLabels[l.type] || l.type;
+
+      if (l.isZone) {
+        // Render as a zone band
+        const zDir     = l.zoneType === 'sell_zone' ? 'var(--sell)' : 'var(--buy)';
+        const rangeStr = '$' + parseFloat(l.minPrice).toFixed(2) + ' – $' + parseFloat(l.maxPrice).toFixed(2);
+        return '<div class="lvl-item" style="border-left:2px solid '+zDir+';padding-left:6px" title="'+l.totalTouches+' liquidity touches clustered into one zone">'+
+          '<span class="lvl-type" style="color:'+zDir+'">'+typeLabel+'</span>'+
+          '<span class="lvl-name">'+sDot+rangeStr+'</span>'+
+          '<span class="lvl-p" style="font-size:9px;color:var(--txt3)">×'+l.totalTouches+'</span>'+
+        '</div>';
+      }
+      return '<div class="lvl-item" title="'+l.label+'">'+
         '<span class="lvl-type">'+typeLabel+'</span>'+
         '<span class="lvl-name">'+sDot+l.label+'</span>'+
         '<span class="lvl-p">$'+parseFloat(l.price).toFixed(3)+'</span>'+
@@ -1048,18 +1057,33 @@ function updateApproachBar(d) {
     bar.style.display = 'none'; return;
   }
   bar.style.display = 'block';
+
+  // Show only the single closest level/zone — no stacking
   const closest   = d.approaching_levels[0];
   const isBuy     = closest.side === 'below';
   const assetName = d.symbol === 'XAUUSD' ? 'Gold' : 'Silver';
-  const zoneType  = isBuy ? 'potential buy zone' : 'potential sell zone';
-  const typeLabel = {'PDH':'Prior High','PDL':'Prior Low','ASH':'Asia Session High',
-                     'ASL':'Asia Session Low','EQH':'Equal Highs','EQL':'Equal Lows'}[closest.type] || closest.label;
+  const dirColor  = isBuy ? 'var(--buy)' : 'var(--sell)';
+  const dirLabel  = isBuy ? 'BUY ZONE' : 'SELL ZONE';
+
+  // Build zone description
+  let zoneDesc;
+  if (closest.isZone) {
+    const lo = parseFloat(closest.minPrice).toFixed(2);
+    const hi = parseFloat(closest.maxPrice).toFixed(2);
+    zoneDesc = assetName + ' approaching <strong>' + dirLabel + ' $' + lo + '–$' + hi +
+      ' (' + closest.totalTouches + ' touches)</strong> — ' + closest.distPct + '% away';
+  } else {
+    const typeLabel = {'PDH':'Prior Day High','PDL':'Prior Day Low',
+      'ASH':'Asia Session High','ASL':'Asia Session Low'}[closest.type] || closest.label;
+    zoneDesc = assetName + ' approaching <strong>' + typeLabel + '</strong> at $' +
+      parseFloat(closest.price).toFixed(3) + ' (' + closest.distPct + '% away)';
+  }
+
   bar.innerHTML =
     '<div class="approach-bar">' +
     '<div class="ab-dot"></div>' +
-    '<span class="ab-dir" style="color:'+(isBuy?'var(--buy)':'var(--sell)')+'">'+(isBuy?'BUY ZONE':'SELL ZONE')+'</span>' +
-    '<span>' + assetName + ' is approaching the <strong>' + typeLabel + '</strong> at $' + closest.price.toFixed(3) +
-    ' (' + closest.distPct + '% away) — this is a ' + zoneType + ' if price sweeps through and reverses</span>' +
+    '<span class="ab-dir" style="color:' + dirColor + '">' + dirLabel + '</span>' +
+    '<span>' + zoneDesc + ' — watch for sweep and reversal</span>' +
     '</div>';
 }
 
@@ -1071,14 +1095,25 @@ function updatePreAlerts(d) {
 
   // Sweep potential alerts
   if (d.sweep_potentials && d.sweep_potentials.length) {
-    d.sweep_potentials.forEach(sp => {
+    // Deduplicate sweep potentials — show only closest unique zone
+    const seenZones = new Set();
+    d.sweep_potentials.filter(sp => {
+      const zoneId = sp.level && sp.level.isZone
+        ? Math.round(sp.level.minPrice) + '-' + Math.round(sp.level.maxPrice)
+        : sp.level ? Math.round(sp.level.price) : 'none';
+      if (seenZones.has(zoneId)) return false;
+      seenZones.add(zoneId); return true;
+    }).slice(0, 1).forEach(sp => {  // max 1 sweep potential card
       const isBuy = sp.direction === 'BUY';
       const aName = d.symbol === 'XAUUSD' ? 'GOLD' : 'SILVER';
+      const zoneTitle = sp.level && sp.level.isZone
+        ? aName + ' — ' + (isBuy ? 'BUY' : 'SELL') + ' ZONE NEARBY'
+        : aName + ' — KEY LEVEL NEARBY';
       parts.push(
         '<div class="pre-alert-card">' +
           '<div class="pac-head">' +
             '<span class="pac-icon">📍</span>' +
-            '<span class="pac-title">' + aName + ' — KEY LEVEL NEARBY</span>' +
+            '<span class="pac-title">' + zoneTitle + '</span>' +
             '<span class="pac-dir ' + (isBuy?'buy':'sell') + '">' + sp.direction + '</span>' +
           '</div>' +
           '<div class="pac-body">' + sp.message + '</div>' +
@@ -1096,7 +1131,13 @@ function updatePreAlerts(d) {
     const aName   = d.symbol === 'XAUUSD' ? 'GOLD' : 'SILVER';
     const icons   = { approaching_liquidity:'📍', sweep_detected:'⚡', displacement_confirmed:'↗', structure_break:'✅' };
     const icon    = icons[ns.stage] || '📡';
-    const headline = alert.headline || (icon + ' ' + aName + ' — ' + ns.stage.replace(/_/g,' ').toUpperCase());
+    // For zone-based setups, enrich the headline with zone range
+    let headline = alert.headline || (icon + ' ' + aName + ' — ' + ns.stage.replace(/_/g,' ').toUpperCase());
+    if (ns.level && ns.level.isZone && ns.stage === 'sweep_detected') {
+      const lo = parseFloat(ns.level.minPrice).toFixed(2);
+      const hi = parseFloat(ns.level.maxPrice).toFixed(2);
+      headline = icon + ' ' + aName + ' — LIQUIDITY GRAB DETECTED ($' + lo + '–$' + hi + ')';
+    }
     const context  = alert.context  || ns.message;
     const action   = alert.action   || 'Monitoring. No action required yet.';
     const biasText = alert.bias     || '—';
