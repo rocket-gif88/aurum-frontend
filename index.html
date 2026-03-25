@@ -1490,6 +1490,12 @@ function renderFeed(){
     const fh = document.getElementById('feed-header'); if(fh) fh.style.display='none';
     return;
   }
+  // Sort by confidence DESC — highest quality first
+  list.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+  // Cap active signals at top 2 to reduce noise
+  const activeList = list.filter(s => s.status === 'active');
+  const closedList = list.filter(s => s.status !== 'active');
+  list = [...activeList.slice(0, 2), ...closedList];
   const fh2 = document.getElementById('feed-header'); if(fh2) fh2.style.display='block';
 
   feed.innerHTML = list.map(sig => {
@@ -1501,7 +1507,9 @@ function renderFeed(){
     const alert      = sig.alert || {};
     const trade      = alert.trade || {};
     const str        = alert.strength || {};
-    const confCls    = sig.confidence >= 85 ? 'conf-hi' : sig.confidence >= 70 ? 'conf-med' : 'conf-lo';
+    const tier       = sig.tier || (sig.confidence >= 75 ? 'HIGH' : sig.confidence >= 60 ? 'VALID' : 'LOW');
+    const confCls    = tier === 'HIGH' ? 'conf-hi' : tier === 'VALID' ? 'conf-med' : 'conf-lo';
+    const tierLabel  = tier === 'HIGH' ? (sig.confidence >= 85 ? 'A+ · HIGH' : 'A · HIGH') : tier === 'VALID' ? 'VALID' : 'LOW';
     const newBadge   = sig.isNew ? '<span class="ac-new">NEW</span>' : '';
     const headline   = alert.headline || (isBuy ? '🟢' : '🔴') + ' ' + sig.asset + ' ' + sig.direction + ' SETUP';
     const context    = alert.context  || buildReason(sig);
@@ -1524,7 +1532,7 @@ function renderFeed(){
           '<div class="ac-headline ' + (isBuy ? 'buy' : 'sell') + '">' + headline + '</div>' +
           '<div class="ac-badges">' + newBadge +
             '<span class="ac-badge sess">' + (sig.session||'—') + '</span>' +
-            '<span class="ac-badge ' + confCls + '">' + sig.confidence + '%</span>' +
+            '<span class="ac-badge ' + confCls + '">' + sig.confidence + ' · ' + tierLabel + '</span>' +
           '</div>' +
           '<span class="ac-time">' + ts + '</span>' +
         '</div>' +
@@ -1546,7 +1554,7 @@ function renderFeed(){
           '</div>' +
           '<div class="ac-strength" style="margin-top:1px">' +
             '<div class="ac-str-item"><div class="ac-str-l">RISK / REWARD</div><div class="ac-str-v" style="color:var(--warn)">' + (trade.rr || '1:'+sig.rr) + '</div></div>' +
-            '<div class="ac-str-item"><div class="ac-str-l">CONFIDENCE</div><div class="ac-str-v">' + confText + '</div></div>' +
+            '<div class="ac-str-item"><div class="ac-str-l">CONFIDENCE</div><div class="ac-str-v" style="color:' + (tier==='HIGH'?'var(--buy)':tier==='VALID'?'var(--warn)':'var(--txt3)') + '">' + sig.confidence + '/100 — ' + tier + '</div></div>' +
             '<div class="ac-str-item"><div class="ac-str-l">MARKET BIAS</div><div class="ac-str-v">' + biasText + '</div></div>' +
           '</div>' +
         '</div>' +
