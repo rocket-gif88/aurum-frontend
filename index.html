@@ -1098,6 +1098,13 @@ function updateApproachBar(d) {
   const pz = d.primary_zone;
   if (!pz) { bar.style.display = 'none'; return; }
 
+  // Hide approach bar when a confirmed sweep or higher stage is active
+  // At that point the pre-alert card gives better context
+  const confirmedStagesBar = ['sweep_detected','displacement_confirmed','structure_break','waiting_pullback','entry_triggered'];
+  if (d.near_setup && confirmedStagesBar.includes(d.near_setup.stage)) {
+    bar.style.display = 'none'; return;
+  }
+
   bar.style.display = 'block';
   const assetName = d.symbol === 'XAUUSD' ? 'Gold' : 'Silver';
   // Always derive direction from zone type — geometry-based direction can be wrong
@@ -1129,7 +1136,9 @@ function buildPreAlertParts(d, dominantDir) {
   const confirmedDir = dominantDir || d.near_setup?.direction || null;
 
   // Sweep potential alerts — only if no active stage-based near_setup
-  const hasNearSetup = !!(d.near_setup && d.near_setup.stage !== 'approaching_liquidity');
+  // Suppress approach cards when a confirmed stage exists (sweep or higher)
+  const confirmedStages = ['sweep_detected','displacement_confirmed','structure_break','waiting_pullback','entry_triggered'];
+  const hasNearSetup = !!(d.near_setup && confirmedStages.includes(d.near_setup.stage));
   if (d.sweep_potentials && d.sweep_potentials.length && !hasNearSetup) {
     const spList = (d.primary_zone && d.sweep_potentials.length)
       ? d.sweep_potentials.filter(sp => {
