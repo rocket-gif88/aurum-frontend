@@ -945,7 +945,7 @@ async function scan(btn){
       if (sysState === 'session_closed') {
         const isSlv = d.symbol === 'XAGUSD';
         const closedMsg = isSlv
-          ? '[' + d.symbol + '] Silver market closed — SLV trades 13:30–20:00 UTC'
+          ? '[' + d.symbol + '] Silver market closed — XAG/USD trades 24/5'
           : '[' + d.symbol + '] Outside trading session';
         logLines.push('<span style="color:var(--txt3)">' + closedMsg + '</span>');
         updatePipeline(sid, 'idle');
@@ -1016,7 +1016,7 @@ function updatePanel(id,d){
   const sysLabels = {
     active:       null,               // use setup_state label
     loading_data: 'Loading market data...',
-    session_closed: id === 'xag' ? 'Market closed — opens 13:30 UTC' : 'Outside trading session',
+    session_closed: 'Outside trading session',
     data_error:   'Live data temporarily unavailable'
   };
   if (sysLabels[sysState]) {
