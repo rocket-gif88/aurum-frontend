@@ -903,6 +903,8 @@ async function scan(btn){
           : '[' + d.symbol + '] Outside trading session';
         logLines.push('<span style="color:var(--txt3)">' + closedMsg + '</span>');
         updatePipeline(sid, 'idle');
+        // Still update the panel with last known price even when closed
+        if (d.price) updatePanel(sid, { ...d, session: 'Closed', current_stage: 'Market closed' });
         return;
       }
       if (d.setup_state === 'standby') {
@@ -959,7 +961,8 @@ async function scan(btn){
 
 function updatePanel(id,d){
   if(d.price) document.getElementById(`sp-${id}-p`).textContent='$'+d.price.toFixed(3);
-  if(d.atr)   document.getElementById(`sp-${id}-atr`).textContent=d.atr.toFixed(4);
+  const atrVal = d.atr || d.volatility_atr;
+  if(atrVal) document.getElementById(`sp-${id}-atr`).textContent=parseFloat(atrVal).toFixed(4);
   if(d.m5_candles) document.getElementById(`sp-${id}-m5`).textContent=d.m5_candles;
   // System state takes priority over setup state display
   const stEl = document.getElementById('sp-'+id+'-st');
@@ -967,7 +970,7 @@ function updatePanel(id,d){
   const sysLabels = {
     active:       null,               // use setup_state label
     loading_data: 'Loading market data...',
-    session_closed:'Outside trading session',
+    session_closed: id === 'xag' ? 'Market closed — opens 13:30 UTC' : 'Outside trading session',
     data_error:   'Live data temporarily unavailable'
   };
   if (sysLabels[sysState]) {
