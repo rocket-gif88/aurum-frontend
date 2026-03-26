@@ -1133,7 +1133,8 @@ function updateApproachBar(d) {
 // PRE-ALERTS PANEL — shows contextual stage alerts
 function buildPreAlertParts(d, dominantDir) {
   const parts = [];
-  const confirmedDir = dominantDir || d.near_setup?.direction || null;
+  // Use zone_direction from server (primary zone type) as canonical direction
+  const confirmedDir = d.zone_direction || dominantDir || d.near_setup?.direction || null;
 
   // Sweep potential alerts — only if no active stage-based near_setup
   // Suppress approach cards when a confirmed stage exists (sweep or higher)
@@ -1464,16 +1465,13 @@ function flushScanUI() {
   const parts = [];
   const seenDirs = new Set(); // prevent BUY + SELL showing simultaneously
 
-  // Find dominant direction across all active setups
-  const activeDirs = _preAlertData
-    .filter(d => d.near_setup?.direction)
-    .map(d => d.near_setup.direction);
-  // If any confirmed sweep/BOS stage exists, that direction wins
+  // Dominant direction: prefer server-provided zone_direction (primary zone direction)
+  // over any geometry-inferred near_setup direction.
+  // Only suppress cross-symbol conflicts — each symbol has its own direction.
   const confirmedStages = _preAlertData
     .filter(d => d.near_setup && ['sweep_detected','displacement_confirmed','structure_break','waiting_pullback','entry_triggered'].includes(d.near_setup.stage));
-  const dominantDir = confirmedStages.length > 0
-    ? confirmedStages[0].near_setup.direction
-    : null;
+  // dominantDir only applies within same symbol — don't suppress XAG because XAU has a direction
+  const dominantDir = null; // per-symbol conflict suppression handled in buildPreAlertParts
 
   _preAlertData.forEach(d => {
     // Build pre-alert parts for this symbol
