@@ -932,7 +932,7 @@ async function scan(btn){
         return;
       }
       if (sysState === 'session_closed') {
-        logLines.push('<span style="color:var(--txt3)">['+d.symbol+'] '+(d.log[0]||'Outside trading session')+'</span>');
+        logLines.push('<span style="color:var(--txt3)">['+d.symbol+'] '+(d.log[0]||id === 'xag' ? 'Market closed — opens 13:30 UTC' : 'Outside trading session')+'</span>');
         updatePipeline(sid, 'idle');
         return;
       }
@@ -1016,7 +1016,7 @@ function updatePanel(id,d){
   const sysLabels = {
     active:       null,               // use setup_state label
     loading_data: 'Loading market data...',
-    session_closed: 'Outside trading session',
+    session_closed: id === 'xag' ? 'Market closed — opens 13:30 UTC' : 'Outside trading session',
     data_error:   'Live data temporarily unavailable'
   };
   if (sysLabels[sysState]) {
