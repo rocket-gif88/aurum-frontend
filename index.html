@@ -754,7 +754,7 @@ let eq       = JSON.parse(localStorage.getItem('au4_eq') || '[1]');
 let prefs    = JSON.parse(localStorage.getItem('au4_p')  || '{}');
 let seq      = parseInt(localStorage.getItem('au4_seq')  || '0');
 let filt     = 'all';
-let autoT    = null;
+// autoT managed by smart auto-refresh engine below
 
 // CLOCK
 function tick(){
