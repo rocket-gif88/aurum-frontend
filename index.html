@@ -390,8 +390,9 @@ canvas{width:100% !important;display:block;}
 .mn.active{color:var(--gold);border-top-color:var(--gold);}
 .mn svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.8;}
 .mn:active{background:var(--bg2);}
-/* Auto-refresh indicator */
+/* Auto-refresh indicator — always visible when active */
 .ar-indicator{display:none;align-items:center;gap:5px;font-family:var(--mono);font-size:9px;color:var(--txt3);}
+.ar-indicator.active{display:flex;}
 .ar-dot{width:6px;height:6px;border-radius:50%;background:var(--buy);animation:pd 2s infinite;}
 .spin{display:inline-block;width:10px;height:10px;border:1.5px solid rgba(255,255,255,.2);border-top-color:currentColor;border-radius:50%;animation:sp .7s linear infinite;vertical-align:middle;}
 @keyframes sp{to{transform:rotate(360deg)}}
@@ -1899,6 +1900,9 @@ function scheduleNextScan() {
   }, AUTO_INTERVAL_MS);
   if(arCountdownT) clearInterval(arCountdownT);
   arCountdownT = setInterval(updateARCountdown, 1000);
+  // Show the indicator
+  const ind = document.getElementById('ar-indicator');
+  if (ind) ind.classList.add('active');
   updateARCountdown();
 }
 
@@ -1911,7 +1915,7 @@ function stopAutoRefresh() {
   if (autoT) { clearTimeout(autoT); autoT = null; }
   if (arCountdownT) { clearInterval(arCountdownT); arCountdownT = null; }
   const ind = document.getElementById('ar-indicator');
-  if(ind) ind.style.display='none';
+  if(ind) ind.classList.remove('active');
 }
 
 // Pause when tab hidden, resume when visible
