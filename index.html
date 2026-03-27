@@ -396,6 +396,13 @@ canvas{width:100% !important;display:block;}
 .ar-dot{width:6px;height:6px;border-radius:50%;background:var(--buy);animation:pd 2s infinite;}
 .spin{display:inline-block;width:10px;height:10px;border:1.5px solid rgba(255,255,255,.2);border-top-color:currentColor;border-radius:50%;animation:sp .7s linear infinite;vertical-align:middle;}
 @keyframes sp{to{transform:rotate(360deg)}}
+/* STATS PANEL */
+.stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--line);margin-bottom:1px;}
+.stat-cell{background:var(--bg2);padding:10px 14px;}
+.stat-lbl{font-family:var(--mono);font-size:8px;color:var(--txt3);letter-spacing:.1em;text-transform:uppercase;margin-bottom:3px;}
+.stat-val{font-family:var(--mono);font-size:18px;font-weight:600;color:var(--txt);}
+.stat-val.good{color:var(--buy);}.stat-val.bad{color:var(--sell);}.stat-val.warn{color:var(--gold);}
+.stat-sub{font-size:9px;color:var(--txt3);margin-top:2px;}
 </style>
 </head>
 <body>
@@ -555,6 +562,22 @@ canvas{width:100% !important;display:block;}
 
     <!-- PERFORMANCE -->
     <div class="page" id="page-performance">
+  <div class="sh"><span class="st">SYSTEM ANALYTICS</span><button onclick="loadStats()" style="font-family:var(--mono);font-size:9px;padding:3px 8px;background:transparent;border:1px solid var(--line);color:var(--txt3);cursor:pointer;letter-spacing:.06em">↻ REFRESH</button></div>
+  <div class="stat-grid" id="stat-grid">
+    <div class="stat-cell"><div class="stat-lbl">Total Setups</div><div class="stat-val" id="st-total">—</div><div class="stat-sub">all time</div></div>
+    <div class="stat-cell"><div class="stat-lbl">Conversion Rate</div><div class="stat-val warn" id="st-conv">—</div><div class="stat-sub">setups → entries</div></div>
+    <div class="stat-cell"><div class="stat-lbl">Win Rate</div><div class="stat-val" id="st-wr">—</div><div class="stat-sub">TP1 or TP2</div></div>
+    <div class="stat-cell"><div class="stat-lbl">Avg Zone Score</div><div class="stat-val" id="st-zone">—</div><div class="stat-sub">out of 100</div></div>
+    <div class="stat-cell"><div class="stat-lbl">Entries</div><div class="stat-val good" id="st-entries">—</div><div class="stat-sub">signals fired</div></div>
+    <div class="stat-cell"><div class="stat-lbl">Invalidations</div><div class="stat-val bad" id="st-inv">—</div><div class="stat-sub">before entry</div></div>
+  </div>
+  <div class="sh" style="margin-top:1px"><span class="st">BY SESSION</span></div>
+  <div id="st-session" style="padding:12px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+  <div class="sh"><span class="st">BY DIRECTION</span></div>
+  <div id="st-dir" style="padding:12px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+  <div class="sh"><span class="st">RECENT SETUPS</span></div>
+  <div id="st-recent" style="padding:8px 18px;font-size:10px;"></div>
+  <div style="height:40px"></div>
       <div class="pw">
         <div class="sg">
           <div class="sb2"><div class="sl2">TOTAL SETUPS</div><div class="sv2" id="p-tot">0</div><div class="ss">Signals generated</div></div>
@@ -775,6 +798,7 @@ setInterval(tick,1000); tick();
 
 // NAV
 function go(n,el){
+  if(n==='performance') setTimeout(loadStats,100);
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.ni,.mn').forEach(t=>t.classList.remove('active'));
   document.getElementById('page-'+n).classList.add('active');
@@ -857,6 +881,7 @@ async function scan(btn){
   // Reset per-scan UI buffers
   _approachBarData = [];
   _preAlertData    = [];
+  _nearSetupData   = [];
   logEl.className = 'scan-log show';
   logEl.innerHTML = '<span style="color:var(--txt3)">Connecting to signal server…</span>';
   // Clear any pending retry timer if user clicks scan manually
@@ -972,9 +997,9 @@ async function scan(btn){
         logLines.push('<span class="log-line ' + cls + '">[' + d.symbol + '] ' + l + '</span>');
       });
       // Signal
-      // Near-setup alert (sweep or displacement stage)
+      // Near-setup alert — collected in buffer, deduped in flushScanUI
       if(d.near_setup && prefs.nearSetup !== false){
-        showNearSetup(d.symbol, d.near_setup, d.directional_bias);
+        _nearSetupData.push({ symbol: d.symbol, ns: d.near_setup, bias: d.directional_bias });
       }
       if(d.signal && d.signal.confidence >= mc){
         processSignal(d.signal);
@@ -1191,9 +1216,10 @@ function buildPreAlertParts(d, dominantDir) {
   const confirmedDir = d.zone_direction || dominantDir || d.near_setup?.direction || null;
 
   // Sweep potential alerts — only if no active stage-based near_setup
-  // Suppress approach cards when a confirmed stage exists (sweep or higher)
+  // Suppress sweep_potentials card whenever near_setup exists (any stage)
+  // Both refer to the same primary zone — only show one card
   const confirmedStages = ['sweep_detected','displacement_confirmed','structure_break','waiting_pullback','entry_triggered'];
-  const hasNearSetup = !!(d.near_setup && confirmedStages.includes(d.near_setup.stage));
+  const hasNearSetup = !!(d.near_setup);
   if (d.sweep_potentials && d.sweep_potentials.length && !hasNearSetup) {
     const spList = (d.primary_zone && d.sweep_potentials.length)
       ? d.sweep_potentials.filter(sp => {
@@ -1302,6 +1328,7 @@ function showNearSetup(symbol, ns, bias) {
   };
   const borderColor = stageColors[ns.stage] || '#e69500';
 
+  el.className = 'near-setup-popup';
   el.style.cssText = 'padding:0;background:var(--bg3);border:1px solid var(--line);border-left:3px solid ' +
     borderColor + ';min-width:260px;max-width:340px;pointer-events:all;animation:si .3s ease;position:relative;';
 
@@ -1492,9 +1519,9 @@ function buildInterpretation(sig) {
 
 
 // ── SCAN RENDER BUFFERS ──────────────────────────────────────────────────────
-// Accumulate data from both symbols during scan, then render once after loop.
 let _approachBarData = [];
 let _preAlertData    = [];
+let _nearSetupData   = [];
 
 function flushScanUI() {
   // Pick the single best approach bar — highest confidence zone, closest to price
@@ -1536,6 +1563,22 @@ function flushScanUI() {
   el.innerHTML = parts.join('');
   _approachBarData = [];
   _preAlertData    = [];
+
+  // Near-setup popups — show max ONE per scan (highest stage, deduped by symbol)
+  // Remove any existing near-setup popups first to prevent stacking
+  document.querySelectorAll('.near-setup-popup').forEach(e => e.remove());
+  if (_nearSetupData.length && prefs.nearSetup !== false) {
+    // Pick the most progressed setup to show (sweep > approaching)
+    const stageRank = { entry_triggered:5, waiting_pullback:4, structure_break:3,
+                        displacement_confirmed:2, sweep_detected:1, approaching_liquidity:0 };
+    _nearSetupData.sort((a,b) => (stageRank[b.ns.stage]||0) - (stageRank[a.ns.stage]||0));
+    const best = _nearSetupData[0];
+    // Only show popup for confirmed stages (not just approaching)
+    if (best.ns.stage !== 'approaching_liquidity') {
+      showNearSetup(best.symbol, best.ns, best.bias);
+    }
+  }
+  _nearSetupData = [];
 }
 
 // ── SETUP STATUS PANEL ──────────────────────────────────────────────────────
@@ -1936,6 +1979,74 @@ document.addEventListener('visibilitychange', () => {
 function toggleAuto(){
   const on=document.getElementById('t-auto')?.checked;
   if(on) startAutoRefresh(); else stopAutoRefresh();
+}
+
+// ── STATS LOADER ─────────────────────────────────────────────────────────────
+async function loadStats() {
+  try {
+    const r = await fetch(SRV + '/stats');
+    const d = await r.json();
+
+    const set = (id, val, cls) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = val;
+      if (cls) el.className = 'stat-val ' + cls;
+    };
+
+    set('st-total',   d.totalSetups ?? '—');
+    set('st-conv',    d.conversionRate != null ? d.conversionRate + '%' : '—', 'warn');
+    set('st-wr',      d.winRate != null ? d.winRate + '%' : '—',
+                      d.winRate >= 55 ? 'good' : d.winRate >= 40 ? 'warn' : 'bad');
+    set('st-zone',    d.avgZoneScore ?? '—');
+    set('st-entries', d.entriesTriggered ?? '—', 'good');
+    set('st-inv',     d.invalidations ?? '—', 'bad');
+
+    // Session breakdown
+    const sess = document.getElementById('st-session');
+    if (sess && d.bySession) {
+      sess.innerHTML = Object.entries(d.bySession).map(([s,v]) =>
+        '<div style="margin-bottom:4px;display:flex;gap:16px">' +
+        '<span style="color:var(--txt3);width:60px">' + s + '</span>' +
+        '<span>' + v.setups + ' setups</span>' +
+        '<span style="color:var(--buy)">' + v.entries + ' entries</span>' +
+        '<span style="color:var(--gold)">' + v.wins + ' wins</span>' +
+        '</div>'
+      ).join('');
+    }
+
+    // Direction breakdown
+    const dir = document.getElementById('st-dir');
+    if (dir && d.byDirection) {
+      dir.innerHTML = Object.entries(d.byDirection).map(([direction,v]) =>
+        '<div style="margin-bottom:4px;display:flex;gap:16px">' +
+        '<span style="color:' + (direction==='BUY'?'var(--buy)':'var(--sell)') + ';width:40px">' + direction + '</span>' +
+        '<span>' + v.setups + ' setups</span>' +
+        '<span style="color:var(--buy)">' + v.entries + ' entries</span>' +
+        '<span style="color:var(--gold)">' + v.wins + ' wins</span>' +
+        '</div>'
+      ).join('');
+    }
+
+    // Recent setups
+    const rec = document.getElementById('st-recent');
+    if (rec && d.recentSetups) {
+      rec.innerHTML = d.recentSetups.map(setup => {
+        const stagesDone = Object.values(setup.stages||{}).filter(Boolean).length;
+        const statusColor = setup.entryTriggered ? 'var(--buy)' : setup.invalidated ? 'var(--sell)' : 'var(--txt3)';
+        const status = setup.result || (setup.entryTriggered ? 'ENTRY' : setup.invalidated ? 'INVALID' : 'ACTIVE');
+        return '<div style="padding:6px 0;border-bottom:1px solid var(--line2);display:flex;gap:12px;align-items:center">' +
+          '<span style="color:' + (setup.direction==='BUY'?'var(--buy)':'var(--sell)') + ';font-family:var(--mono);font-size:9px;width:32px">' + setup.direction + '</span>' +
+          '<span style="color:var(--txt3);font-size:9px;width:36px">' + (setup.symbol==='XAUUSD'?'GOLD':'SILVER') + '</span>' +
+          '<span style="font-family:var(--mono);font-size:9px;color:var(--txt3);width:28px">' + (setup.zone?.score||'?') + '/100</span>' +
+          '<span style="font-size:9px;color:var(--txt3)">' + stagesDone + '/5 stages</span>' +
+          '<span style="margin-left:auto;font-family:var(--mono);font-size:9px;color:' + statusColor + '">' + status + '</span>' +
+          '</div>';
+      }).join('') || '<span style="color:var(--txt3)">No setups logged yet</span>';
+    }
+  } catch(e) {
+    console.error('Stats load error:', e);
+  }
 }
 
 // INIT
