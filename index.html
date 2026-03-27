@@ -434,7 +434,7 @@ canvas{width:100% !important;display:block;}
     <div class="sep"></div>
     <div class="chip"><span class="chip-s">XAUUSD</span><span class="chip-v g" id="t-xau">—</span></div>
     <div class="chip"><span class="chip-s">XAGUSD</span><span class="chip-v s" id="t-xag">—</span></div>
-    <div class="chip"><span class="chip-s">RATIO</span><span class="chip-v r" id="t-ratio">—</span></div>
+    <div class="chip" title="Gold/Silver ratio (XAU/XAG spot)"><span class="chip-s">XAU/XAG</span><span class="chip-v r" id="t-ratio">—</span></div>
     <div class="sp1"></div>
     <div id="sys-state-chip" style="font-family:var(--mono);font-size:9px;padding:4px 9px;border:1px solid var(--line);color:var(--txt3);letter-spacing:.06em;display:none"></div>
       <div class="ar-indicator" id="ar-indicator" title="Auto-scan active">
@@ -982,6 +982,11 @@ async function scan(btn){
         logLines.push('<span class="log-line warn">['+d.symbol+'] '+(d.log[0]||'Standby')+'</span>');
         updatePipeline(sid, 'standby');
         return;
+      }
+      // Update topbar price directly from scan result (solves cold-start race)
+      if (d.price) {
+        const topEl = document.getElementById(sid === 'xau' ? 't-xau' : 't-xag');
+        if (topEl) topEl.textContent = '$' + parseFloat(d.price).toFixed(2);
       }
       // Update side panel
       updatePanel(sid, d);
