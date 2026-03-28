@@ -927,9 +927,15 @@ async function scan(btn){
     const fxau = document.getElementById('f-xau')?.checked !== false;
     const fxag = document.getElementById('f-xag')?.checked !== false;
     const mc   = parseInt(document.getElementById('min-conf')?.value||80);
+    // 25-second timeout per symbol — prevents infinite hang if Twelve Data is slow
+    const analyzeWithTimeout = (sym) => Promise.race([
+      fetch(`${SRV}/analyze/${sym}`).then(r=>r.json()),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout after 25s')), 25000))
+    ]).catch(e => ({ success:false, error: e.message, symbol: sym }));
+
     const tasks = [];
-    if(fxau) tasks.push(fetch(`${SRV}/analyze/XAUUSD`).then(r=>r.json()).catch(e=>({success:false,error:e.message,symbol:'XAUUSD'})));
-    if(fxag) tasks.push(fetch(`${SRV}/analyze/XAGUSD`).then(r=>r.json()).catch(e=>({success:false,error:e.message,symbol:'XAGUSD'})));
+    if(fxau) tasks.push(analyzeWithTimeout('XAUUSD'));
+    if(fxag) tasks.push(analyzeWithTimeout('XAGUSD'));
     const results = await Promise.all(tasks);
 
     let logLines = [];
@@ -1013,6 +1019,9 @@ async function scan(btn){
     logEl.innerHTML = logLines.join('<br>') || '<span style="color:var(--txt3)">Scan complete — see Setup Status panel above for current stage.</span>';
     // Render approach bar + pre-alerts once for all symbols (prevents XAG overwriting XAU)
     flushScanUI();
+    // Update system chip to ACTIVE on successful scan
+    const sysChipOk = document.getElementById('sys-state-chip');
+    if(sysChipOk){ sysChipOk.textContent='● ACTIVE'; sysChipOk.style.color='var(--buy)'; }
 
   } catch(e) {
     console.error('Scan error:', e);
