@@ -526,6 +526,7 @@ canvas{width:100% !important;display:block;}
             <div class="sp-row"><span class="sp-lbl">Current stage</span><span class="sp-val" id="sp-xau-st" style="font-size:9px;color:var(--txt3)">—</span></div>
             <div class="sp-row"><span class="sp-lbl" title="London: 07:00-16:00 UTC · New York: 13:00-22:00 UTC">Active session</span><span class="sp-val" id="sp-xau-sess" style="font-size:9px">—</span></div>
               <div class="sp-row"><span class="sp-lbl" title="Directional lean based on price position relative to Prior Day High/Low">Market bias</span><span class="sp-val" id="sp-xau-bias" style="font-size:9px;color:var(--txt3)">—</span></div>
+              <div class="sp-row"><span class="sp-lbl" title="M15 higher timeframe structural bias">HTF bias (M15)</span><span class="sp-val" id="sp-xau-htf" style="font-size:9px;color:var(--txt3)">—</span></div>
             <div style="font-family:var(--mono);font-size:8px;color:var(--txt3);margin-top:8px;letter-spacing:.06em;margin-bottom:4px" title="Clustered liquidity zones — equal highs/lows grouped into unified areas">LIQUIDITY ZONES</div>
             <div id="sp-xau-lvls"></div>
           </div>
@@ -537,6 +538,7 @@ canvas{width:100% !important;display:block;}
             <div class="sp-row"><span class="sp-lbl">Current stage</span><span class="sp-val" id="sp-xag-st" style="font-size:9px;color:var(--txt3)">—</span></div>
             <div class="sp-row"><span class="sp-lbl" title="London: 07:00-16:00 UTC · New York: 13:00-22:00 UTC">Active session</span><span class="sp-val" id="sp-xag-sess" style="font-size:9px">—</span></div>
               <div class="sp-row"><span class="sp-lbl" title="Directional lean based on price position relative to Prior Day High/Low">Market bias</span><span class="sp-val" id="sp-xag-bias" style="font-size:9px;color:var(--txt3)">—</span></div>
+              <div class="sp-row"><span class="sp-lbl" title="M15 higher timeframe structural bias">HTF bias (M15)</span><span class="sp-val" id="sp-xag-htf" style="font-size:9px;color:var(--txt3)">—</span></div>
             <div style="font-family:var(--mono);font-size:8px;color:var(--txt3);margin-top:8px;letter-spacing:.06em;margin-bottom:4px" title="Clustered liquidity zones — equal highs/lows grouped into unified areas">LIQUIDITY ZONES</div>
             <div id="sp-xag-lvls"></div>
           </div>
@@ -963,8 +965,22 @@ async function scan(btn){
         return;
       }
       if (sysState === 'session_closed') {
-        logLines.push('<span style="color:var(--txt3)">['+d.symbol+'] '+(d.log[0]||id === 'xag' ? 'Market closed — opens 13:30 UTC' : 'Outside trading session')+'</span>');
+        const closedMsg = d.symbol === 'XAGUSD'
+          ? 'Market closed — opens 13:30 UTC' + (d.price ? ' · Last: $' + parseFloat(d.price).toFixed(3) : '')
+          : (d.log[0] || 'Outside trading session');
+        logLines.push('<span style="color:var(--txt3)">['+d.symbol+'] '+closedMsg+'</span>');
         updatePipeline(sid, 'idle');
+        // Update side panel with last known price even when closed
+        if (d.price) {
+          const prEl = document.getElementById('sp-'+sid+'-p');
+          if (prEl) prEl.textContent = '$' + parseFloat(d.price).toFixed(3);
+          const topEl = document.getElementById(sid === 'xau' ? 't-xau' : 't-xag');
+          if (topEl) topEl.textContent = '$' + parseFloat(d.price).toFixed(3);
+        }
+        const stEl = document.getElementById('sp-'+sid+'-st');
+        if (stEl) { stEl.textContent = 'Market closed'; stEl.style.color = 'var(--txt3)'; }
+        const sessEl = document.getElementById('sp-'+sid+'-sess');
+        if (sessEl) sessEl.textContent = 'Closed';
         return;
       }
       if (sysState === 'data_error') {
@@ -1081,6 +1097,16 @@ function updatePanel(id,d){
     };
     biasEl.textContent = biasMap[d.directional_bias] || ('Neutral (score ' + biasScore + ')');
     biasEl.style.color = biasLabel==='BUY'?'var(--buy)':biasLabel==='SELL'?'var(--sell)':'var(--txt3)';
+
+  // HTF bias
+  const htfEl = document.getElementById(`sp-${id}-htf`);
+  if (htfEl && d.htf_bias) {
+    const htfColors = { BULLISH:'var(--buy)', BEARISH:'var(--sell)', NEUTRAL:'var(--txt3)' };
+    const htfLabels = { BULLISH:'▲ Bullish', BEARISH:'▼ Bearish', NEUTRAL:'— Neutral' };
+    htfEl.textContent = htfLabels[d.htf_bias] || d.htf_bias;
+    htfEl.style.color = htfColors[d.htf_bias] || 'var(--txt3)';
+    if (d.htf_reason) htfEl.title = d.htf_reason;
+  }
   }
 
   // Approach bar + pre-alerts — accumulate across symbols, rendered after scan loop
