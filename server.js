@@ -2,6 +2,9 @@ const express = require('express');
 const cors    = require('cors');
 const fetch   = require('node-fetch');
 const app     = express();
+const { hydrateFromSheets, updateZoneMemory, getZoneFreshness,
+        clearZoneMemory, detectVWAPReclaim, formatATRBlock,
+        getSessionQuality } = require('./aurum-upgrades');
 // CORS: allow Netlify frontend and any origin (needed for Railway free tier)
 app.use(cors({
   origin: '*',                   // allow all origins — tighten if needed
@@ -11,12 +14,243 @@ app.use(cors({
 app.options('*', cors());        // handle preflight for all routes
 app.use(express.json());
 
+const fs   = require('fs');
+const path = require('path');
+
 const TWELVE_KEY    = '7f3fc6ca85664930ab6e687db8ff0c5d';
+// TELEGRAM_MODE: 'EXECUTION' (default) = pre-entry + entry + conditional invalidation only
+//                'FULL'                 = all stage alerts (debug/verbose)
+const TELEGRAM_MODE = process.env.TELEGRAM_MODE || 'EXECUTION';
 const ANTHROPIC_KEY = ['sk-ant-','api03-PSBtiCb9gNCUnpxHjEl2sqWVtfNop5DtO1WCW2pdUw_upi3Zl0VDjCT7Yyk','W9bboA3Bxnq2ucHBFyuNrNx6CL','w-qYuk4wAA'].join('');
+// ═══════════════════════════════════════════════════════════════════════════
+// SETUP LOGGING & ANALYTICS SYSTEM
+// Passive, non-blocking, append-only. Never touches trading logic.
+// Logs every setup lifecycle event to logs.jsonl
+// ═══════════════════════════════════════════════════════════════════════════
+
+// In-memory log store — keyed by setup.id
+const _setupLogs = {};
+
+// ── GOOGLE SHEETS LOGGING ────────────────────────────────────────────────────
+// Credentials and sheet ID loaded from Railway environment variables:
+//   GOOGLE_SERVICE_ACCOUNT_JSON  — full service account JSON (stringified)
+//   GOOGLE_SHEET_ID              — the ID from the sheet URL
+//
+// Sheet columns (row per event):
+// A: Timestamp | B: Setup ID | C: Symbol | D: Direction | E: Session
+// F: Zone Low  | G: Zone High | H: Zone Score | I: Touches
+// J: Event     | K: Entry Price | L: Stop Loss | M: TP1 | N: TP2
+// O: Candles   | P: Result | Q: Invalidation Reason | R: Stages
+
+let _sheetsClient = null;
+
+async function getSheetsClient() {
+  if (_sheetsClient) return _sheetsClient;
+  try {
+    const credsJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+    if (!credsJson) { console.log('[sheets] No credentials — logging disabled'); return null; }
+    const { google } = require('googleapis');
+    const creds = JSON.parse(credsJson);
+    const auth  = new google.auth.GoogleAuth({
+      credentials: creds,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    _sheetsClient = google.sheets({ version: 'v4', auth });
+    console.log('[sheets] Google Sheets client initialised');
+    return _sheetsClient;
+  } catch(e) {
+    console.error('[sheets] Init error:', e.message);
+    return null;
+  }
+}
+
+async function appendToSheet(row) {
+  try {
+    const sheetId = process.env.GOOGLE_SHEET_ID;
+    if (!sheetId) return;
+    const sheets  = await getSheetsClient();
+    if (!sheets)  return;
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: sheetId,
+      range:         'Aurum!A:R',
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [row] },
+    });
+  } catch(e) {
+    // Never let logging break the trading engine
+    console.error('[sheets] Append error:', e.message);
+  }
+}
+
+function detectSessionTag(utcHour) {
+  if (utcHour >= 0  && utcHour < 7)  return 'ASIA';
+  if (utcHour >= 7  && utcHour < 13) return 'LONDON';
+  if (utcHour >= 13 && utcHour < 22) return 'NY';
+  return 'OFF';
+}
+
+// Called when setup is created
+function logSetupCreated(setup, primaryZone) {
+  try {
+    const h = new Date().getUTCHours();
+    const log = {
+      id:              setup.id,
+      symbol:          setup.sym,
+      direction:       setup.direction,
+      zone: {
+        low:    primaryZone?.minPrice || null,
+        high:   primaryZone?.maxPrice || null,
+        score:  primaryZone?.confidence?.total || null,
+        touches:primaryZone?.totalTouches || null,
+      },
+      session:          detectSessionTag(h),
+      timestamp_start:  new Date().toISOString(),
+      htfBias:              null, // set when first stage fires
+      biasAlignment:        null, // 'ALIGNED' | 'COUNTER' | 'NEUTRAL'
+      confidenceBeforeBias: null,
+      confidenceAfterBias:  null,
+      stages: { liquidity_grab:false, strong_move:false, trend_shift:false, pullback:false, entry:false },
+      entryTriggered:   false,
+      entryPrice:       null,
+      stopLoss:         null,
+      takeProfits:      [],
+      invalidated:      false,
+      invalidationReason: null,
+      timestamp_end:    null,
+      candlesToEntry:   null,
+      candlesToInvalidation: null,
+      startCandleMs:    Date.now(),
+      result:           null,
+      _version:         1,
+    };
+    _setupLogs[setup.id] = log;
+    console.log('[log] Setup created: ' + setup.sym + ' ' + setup.direction +
+      ' zone=' + (primaryZone?.priceRange || '?') + ' score=' + (primaryZone?.confidence?.total || '?'));
+    // Append to Google Sheets (non-blocking)
+    appendToSheet([
+      new Date().toISOString(), setup.id, setup.sym, setup.direction,
+      detectSessionTag(h),
+      primaryZone?.minPrice || '', primaryZone?.maxPrice || '',
+      primaryZone?.confidence?.total || '', primaryZone?.totalTouches || '',
+      'CREATED', '', '', '', '', '', '', '', ''
+    ]);
+  } catch(e) { console.error('[log] logSetupCreated error:', e.message); }
+}
+
+// Called when a stage is confirmed
+function logStageUpdate(setup, stage) {
+  try {
+    const log = _setupLogs[setup.id];
+    if (!log) return;
+    const stageMap = { sweep:'liquidity_grab', move:'strong_move', trend:'trend_shift', pullback:'pullback', entry:'entry' };
+    const key = stageMap[stage];
+    if (key) log.stages[key] = true;
+    log._version++;
+    console.log('[log] Stage: ' + setup.sym + ' → ' + stage);
+    appendToSheet([
+      new Date().toISOString(), setup.id, log.symbol, log.direction,
+      log.session, log.zone?.low||'', log.zone?.high||'',
+      log.zone?.score||'', log.zone?.touches||'',
+      'STAGE:' + stage.toUpperCase(), '', '', '', '', '', '', '',
+      Object.entries(log.stages).filter(([,v])=>v).map(([k])=>k).join(',')
+    ]);
+  } catch(e) { console.error('[log] logStageUpdate error:', e.message); }
+}
+
+// Called when entry signal fires
+function logEntryTriggered(setup, entryPrice, stopLoss, takeProfits) {
+  try {
+    const log = _setupLogs[setup.id];
+    if (!log) return;
+    log.entryTriggered  = true;
+    log.entryPrice      = entryPrice;
+    log.stopLoss        = stopLoss;
+    log.takeProfits     = takeProfits;
+    log.stages.entry    = true;
+    const elapsed = Date.now() - log.startCandleMs;
+    log.candlesToEntry  = Math.round(elapsed / (5 * 60 * 1000));
+    log.timestamp_end   = new Date().toISOString();
+    // Capture HTF bias from symTiming at time of entry
+    const _t = symTiming[setup.sym];
+    if (_t && !log.htfBias) {
+      log.htfBias = _t.htfBias || 'NEUTRAL';
+      const htfAligned = (log.htfBias === 'BULLISH' && setup.direction === 'BUY') ||
+                         (log.htfBias === 'BEARISH' && setup.direction === 'SELL');
+      const htfCounter = (log.htfBias === 'BULLISH' && setup.direction === 'SELL') ||
+                         (log.htfBias === 'BEARISH' && setup.direction === 'BUY');
+      log.biasAlignment = htfAligned ? 'ALIGNED' : htfCounter ? 'COUNTER' : 'NEUTRAL';
+    }
+    log._version++;
+    const _logHtf = log.htfBias || 'NEUTRAL';
+    console.log('[log] Entry triggered: ' + setup.sym + ' @ ' + entryPrice +
+      ' SL=' + stopLoss + ' TP1=' + (takeProfits[0]||'?') + ' candles=' + log.candlesToEntry +
+      ' HTF=' + _logHtf);
+    appendToSheet([
+      new Date().toISOString(), setup.id, log.symbol, log.direction,
+      log.session, log.zone?.low||'', log.zone?.high||'',
+      log.zone?.score||'', log.zone?.touches||'',
+      'ENTRY', entryPrice, stopLoss, takeProfits[0]||'', takeProfits[1]||'',
+      log.candlesToEntry, '', '', 'all'
+    ]);
+  } catch(e) { console.error('[log] logEntryTriggered error:', e.message); }
+}
+
+// Called when setup is invalidated
+function logInvalidation(setup, reason) {
+  try {
+    const log = _setupLogs[setup.id];
+    if (!log) return;
+    log.invalidated         = true;
+    log.invalidationReason  = reason;
+    log.timestamp_end       = new Date().toISOString();
+    const elapsed = Date.now() - log.startCandleMs;
+    log.candlesToInvalidation = Math.round(elapsed / (5 * 60 * 1000));
+    log._version++;
+    console.log('[log] Invalidated: ' + setup.sym + ' reason="' + reason + '" candles=' + log.candlesToInvalidation);
+    appendToSheet([
+      new Date().toISOString(), setup.id, log.symbol, log.direction,
+      log.session, log.zone?.low||'', log.zone?.high||'',
+      log.zone?.score||'', log.zone?.touches||'',
+      'INVALIDATED', '', '', '', '',
+      log.candlesToInvalidation, '', reason,
+      Object.entries(log.stages).filter(([,v])=>v).map(([k])=>k).join(',')
+    ]);
+    setTimeout(() => { delete _setupLogs[setup.id]; }, 2000);
+  } catch(e) { console.error('[log] logInvalidation error:', e.message); }
+}
+
+// Update trade result (TP1/TP2/SL/BE) — called manually or from future price checker
+function logTradeResult(setupId, result) {
+  try {
+    const log = _setupLogs[setupId];
+    if (log) {
+      log.result    = result;
+      log._version++;
+    }
+    console.log('[log] Result: ' + setupId + ' → ' + result);
+    appendToSheet([
+      new Date().toISOString(), setupId,
+      log?.symbol||'', log?.direction||'', log?.session||'',
+      log?.zone?.low||'', log?.zone?.high||'',
+      log?.zone?.score||'', log?.zone?.touches||'',
+      'RESULT', log?.entryPrice||'', log?.stopLoss||'',
+      log?.takeProfits?.[0]||'', log?.takeProfits?.[1]||'',
+      '', result, '', ''
+    ]);
+  } catch(e) { console.error('[log] logTradeResult error:', e.message); }
+}
+
+// Read all logs — from in-memory store (session data)
+// Historical data lives in Google Sheets
+function readAllLogs() {
+  return Object.values(_setupLogs);
+}
+
 const SYMBOLS = {
   XAUUSD: 'XAU/USD',   // Gold spot — free tier
-  XAGUSD: 'SLV'        // Silver via iShares Silver Trust ETF (SLV) — free tier
-                        // XAG/USD requires Twelve Data paid plan; SLV tracks silver 1:1
+  XAGUSD: 'SLV'        // Silver via iShares Silver Trust ETF (SLV) — free tier proxy
+                        // Trades 13:30-20:00 UTC (covers London/NY overlap + full NY session)
 };
 
 // ─── IN-MEMORY CACHE ────────────────────────────────────────────────────────
@@ -204,51 +438,150 @@ function sessionWeight(name) {
 function isActiveSession(tsMs) { return sessionName(tsMs) !== null; }
 
 // ─── LIQUIDITY LEVELS ─────────────────────────────────────────────────────
+// ─── LIQUIDITY ZONE CLUSTERING ───────────────────────────────────────────────
+// Groups nearby EQH/EQL levels within CLUSTER_PCT into unified trading zones.
+// Prevents multiple overlapping levels triggering separate alerts.
+const CLUSTER_PCT = 0.0015; // 0.15% of price — groups levels within ~$6-7 at gold prices
+
+function clusterEQLevels(rawLevels, currentPrice, zoneType) {
+  // zoneType: 'EQH' (sell zones) or 'EQL' (buy zones)
+  if (!rawLevels.length) return [];
+
+  // Sort by price
+  const sorted = [...rawLevels].sort((a, b) => a.price - b.price);
+  const threshold = currentPrice * CLUSTER_PCT;
+  const clusters  = [];
+  let current     = [sorted[0]];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const gap = sorted[i].price - sorted[i-1].price;
+    if (gap <= threshold) {
+      current.push(sorted[i]);
+    } else {
+      clusters.push(current);
+      current = [sorted[i]];
+    }
+  }
+  clusters.push(current);
+
+  // Merge overlapping clusters (edge case)
+  const merged = [];
+  for (const cl of clusters) {
+    const last = merged[merged.length - 1];
+    if (last && cl[0].price - last.maxPrice <= threshold) {
+      // Merge into previous cluster
+      last.levels.push(...cl);
+      last.maxPrice     = Math.max(last.maxPrice, ...cl.map(l => l.price));
+      last.minPrice     = Math.min(last.minPrice, ...cl.map(l => l.price));
+      last.totalTouches = last.levels.reduce((s, l) => s + (l.touches || 1), 0);
+      last.strengthScore= last.levels.reduce((s, l) => Math.max(s, l.strengthScore || 1), 0);
+    } else {
+      const allTouches  = cl.reduce((s, l) => s + (l.touches || 1), 0);
+      const maxStr      = cl.reduce((s, l) => Math.max(s, l.strengthScore || 1), 0);
+      const avgPrice    = cl.reduce((s, l) => s + l.price, 0) / cl.length;
+      const clMin = Math.min(...cl.map(l => l.price));
+      const clMax = Math.max(...cl.map(l => l.price));
+      // Reject single-point zones (min === max) — not real zones
+      if (clMin === clMax && cl.length < 2) {
+        console.log('[levels] Skipping degenerate zone (min=max) at $' + clMin.toFixed(3));
+        continue; // skip this cluster
+      }
+      const avgWickZone = cl.reduce((s,l) => s + (l.avgWick||0), 0) / cl.length;
+      const lastIdxZone = Math.max(...cl.map(l => l.lastCandleIdx || 0));
+      merged.push({
+        type:          zoneType,
+        zoneType:      zoneType === 'EQH' ? 'sell_zone' : 'buy_zone',
+        price:         avgPrice,
+        minPrice:      clMin,
+        maxPrice:      clMax,
+        totalTouches:  allTouches,
+        levelCount:    cl.length,
+        levels:        cl,
+        strengthScore: maxStr,
+        strength:      maxStr >= 3 ? 'strong' : maxStr >= 2 ? 'medium' : 'weak',
+        isZone:        true,
+        avgWick:       avgWickZone,       // for reaction scoring
+        lastCandleIdx: lastIdxZone,       // for recency scoring (index within recent20)
+        label:         zoneType === 'EQH'
+          ? 'Equal Highs zone (' + allTouches + ' touches)'
+          : 'Equal Lows zone ('  + allTouches + ' touches)',
+        priceRange:    parseFloat(clMin.toFixed(3)) + '–' + parseFloat(clMax.toFixed(3))
+      });
+    }
+  }
+  // ── POST-CLUSTER OVERLAP MERGE ────────────────────────────────
+  // Zones from different raw groups can still overlap if their price ranges intersect.
+  // Example: zone 4430–4449 and zone 4439–4443 are the same structure.
+  // Merge any overlapping zones, keeping the strongest properties.
+  const deduped = [];
+  for (const z of merged) {
+    let absorbed = false;
+    for (const existing of deduped) {
+      // Overlap condition: ranges intersect
+      if (z.minPrice <= existing.maxPrice && z.maxPrice >= existing.minPrice) {
+        // Merge into existing — expand range, take max touches, keep most recent
+        const prevRange = (existing.maxPrice - existing.minPrice).toFixed(3);
+        existing.minPrice     = Math.min(existing.minPrice, z.minPrice);
+        existing.maxPrice     = Math.max(existing.maxPrice, z.maxPrice);
+        existing.totalTouches = Math.max(existing.totalTouches, z.totalTouches);
+        existing.avgWick      = Math.max(existing.avgWick || 0, z.avgWick || 0);
+        existing.lastCandleIdx= Math.max(existing.lastCandleIdx || 0, z.lastCandleIdx || 0);
+        existing.strengthScore= Math.max(existing.strengthScore, z.strengthScore);
+        existing.levelCount   = (existing.levelCount || 1) + (z.levelCount || 1);
+        existing.price        = (existing.minPrice + existing.maxPrice) / 2;
+        existing.label        = zoneType === 'EQH'
+          ? 'Equal Highs zone (' + existing.totalTouches + ' touches)'
+          : 'Equal Lows zone ('  + existing.totalTouches + ' touches)';
+        existing.priceRange   = parseFloat(existing.minPrice.toFixed(3)) + '–' +
+                                parseFloat(existing.maxPrice.toFixed(3));
+        existing.strength     = existing.strengthScore >= 3 ? 'strong'
+                              : existing.strengthScore >= 2 ? 'medium' : 'weak';
+        console.log('[zone-merge] ' + zoneType + ' overlap merged: ' +
+          prevRange + ' + ' + (z.maxPrice - z.minPrice).toFixed(3) +
+          ' → ' + (existing.maxPrice - existing.minPrice).toFixed(3) +
+          ' touches: ' + existing.totalTouches);
+        absorbed = true;
+        break;
+      }
+    }
+    if (!absorbed) deduped.push(z);
+  }
+  return deduped;
+}
+
 function buildLevels(m5Candles, m15Candles) {
   const levels = [];
-  const now = Date.now();
-
-  // Previous Day H/L — candles from yesterday UTC date
   const todayUTC = new Date(); todayUTC.setUTCHours(0,0,0,0);
-  const ydayStart = todayUTC.getTime() - 86400000;
-  const ydayEnd   = todayUTC.getTime();
-  const yday = m15Candles.filter(c => c.t >= ydayStart && c.t < ydayEnd);
+
+  // Previous Day H/L
+  const yday = m15Candles.filter(c => c.t >= todayUTC.getTime()-86400000 && c.t < todayUTC.getTime());
   if (yday.length > 0) {
     levels.push({ price: Math.max(...yday.map(c=>c.h)), type:'PDH', label:'Previous Day High', strength:'strong', strengthScore:3 });
     levels.push({ price: Math.min(...yday.map(c=>c.l)), type:'PDL', label:'Previous Day Low',  strength:'strong', strengthScore:3 });
   }
 
-  // Asian Session H/L — today 00:00–08:00 UTC on M15
-  const asian = m15Candles.filter(c => {
-    const h = new Date(c.t).getUTCHours();
-    return c.t >= todayUTC.getTime() && h < 8;
-  });
+  // Asian Session H/L
+  const asian = m15Candles.filter(c => c.t >= todayUTC.getTime() && new Date(c.t).getUTCHours() < 8);
   if (asian.length > 0) {
     levels.push({ price: Math.max(...asian.map(c=>c.h)), type:'ASH', label:'Asian Session High', strength:'medium', strengthScore:2 });
     levels.push({ price: Math.min(...asian.map(c=>c.l)), type:'ASL', label:'Asian Session Low',  strength:'medium', strengthScore:2 });
   }
 
-  // Equal Highs / Lows — M5, last 20 candles, within 0.05%
+  // Equal Highs / Lows — detect raw groups first, then cluster into zones
   const recent20 = m5Candles.slice(-20);
-  const EQ_TOL   = 0.0005; // 0.05%
+  const EQ_TOL   = 0.0005; // 0.05% for raw grouping
 
-  // Equal Highs
+  // Detect raw EQH groups
   const eqHighGroups = [];
-  recent20.forEach((c, i) => {
+  recent20.forEach(c => {
     let placed = false;
     for (const g of eqHighGroups) {
       if (pct(c.h, g[0].h) <= EQ_TOL) { g.push(c); placed = true; break; }
     }
     if (!placed) eqHighGroups.push([c]);
   });
-  eqHighGroups.filter(g => g.length >= 2).forEach(g => {
-    const avg = g.reduce((s,c)=>s+c.h,0)/g.length;
-    const strength = g.length >= 4 ? 'strong' : g.length === 3 ? 'medium' : 'weak';
-    levels.push({ price: avg, type:'EQH', label:'Equal Highs (x'+g.length+')',
-                  strength, strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1, touches: g.length });
-  });
 
-  // Equal Lows
+  // Detect raw EQL groups
   const eqLowGroups = [];
   recent20.forEach(c => {
     let placed = false;
@@ -257,11 +590,42 @@ function buildLevels(m5Candles, m15Candles) {
     }
     if (!placed) eqLowGroups.push([c]);
   });
-  eqLowGroups.filter(g => g.length >= 2).forEach(g => {
-    const avg = g.reduce((s,c)=>s+c.l,0)/g.length;
-    const strength = g.length >= 4 ? 'strong' : g.length === 3 ? 'medium' : 'weak';
-    levels.push({ price: avg, type:'EQL', label:'Equal Lows (x'+g.length+')',
-                  strength, strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1, touches: g.length });
+
+  // Build raw EQH levels — attach candle indices for recency + reaction scoring
+  const rawEQH = eqHighGroups.filter(g => g.length >= 2).map(g => {
+    const avg      = g.reduce((s,c)=>s+c.h,0)/g.length;
+    // Find index of most recent candle in this group within recent20
+    const lastIdx  = recent20.length - 1 - [...recent20].reverse().findIndex(c =>
+      g.some(gc => Math.abs(gc.h - c.h) < avg * 0.0005));
+    // Average wick size as proxy for reaction strength
+    const avgWick  = g.reduce((s,c) => s + (c.h - Math.max(c.o, c.c)), 0) / g.length;
+    return { price: avg, type:'EQH', touches: g.length, lastCandleIdx: lastIdx,
+             avgWick, strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1 };
+  });
+
+  const rawEQL = eqLowGroups.filter(g => g.length >= 2).map(g => {
+    const avg      = g.reduce((s,c)=>s+c.l,0)/g.length;
+    const lastIdx  = recent20.length - 1 - [...recent20].reverse().findIndex(c =>
+      g.some(gc => Math.abs(gc.l - c.l) < avg * 0.0005));
+    const avgWick  = g.reduce((s,c) => s + (Math.min(c.o, c.c) - c.l), 0) / g.length;
+    return { price: avg, type:'EQL', touches: g.length, lastCandleIdx: lastIdx,
+             avgWick, strengthScore: g.length >= 4 ? 3 : g.length === 3 ? 2 : 1 };
+  });
+
+  // Current price for clustering threshold
+  const currentPrice = m5Candles[m5Candles.length-1]?.c || 1;
+
+  // Cluster into zones
+  const eqhZones = clusterEQLevels(rawEQH, currentPrice, 'EQH');
+  const eqlZones = clusterEQLevels(rawEQL, currentPrice, 'EQL');
+
+  eqhZones.forEach(z => {
+    console.log('[levels] Clustered ' + z.levelCount + ' EQH levels → SELL zone ' + z.priceRange + ' (' + z.totalTouches + ' touches)');
+    levels.push(z);
+  });
+  eqlZones.forEach(z => {
+    console.log('[levels] Clustered ' + z.levelCount + ' EQL levels → BUY zone ' + z.priceRange + ' (' + z.totalTouches + ' touches)');
+    levels.push(z);
   });
 
   return levels;
@@ -275,39 +639,309 @@ function detectApproaching(price, levels, sym) {
   const threshold = APPROACH_PCT[sym] || 0.0020;
   return levels
     .map(lvl => {
-      const dist    = Math.abs(price - lvl.price);
-      const distPct = dist / lvl.price;
+      // For zones: use nearest edge. For single levels: use price.
+      const nearEdge = lvl.isZone
+        ? (price > lvl.maxPrice ? lvl.maxPrice : price < lvl.minPrice ? lvl.minPrice : price)
+        : lvl.price;
+      const dist    = Math.abs(price - nearEdge);
+      const distPct = dist / nearEdge;
+      const inside  = lvl.isZone && price >= lvl.minPrice && price <= lvl.maxPrice;
       return {
         ...lvl,
         dist:       parseFloat(dist.toFixed(4)),
         distPct:    parseFloat((distPct * 100).toFixed(3)),
-        approaching: distPct <= threshold,
-        side:       price > lvl.price ? 'above' : 'below'
+        approaching: distPct <= threshold || inside,
+        inside,
+        side:       price > nearEdge ? 'above' : 'below'
       };
     })
     .filter(l => l.approaching)
     .sort((a, b) => a.distPct - b.distPct);
 }
 
+// ── ZONE CONFIDENCE SCORING (0–100) ──────────────────────────────────────────
+// Used for pre-signal gating and UI display.
+// Separate from full signal scoreSetup() — zones don't have BOS/pullback yet.
+// ═══════════════════════════════════════════════════════════════════════════
+// ZONE RANKING & SELECTION ENGINE
+// Scores all valid zones, selects ONE primary zone per symbol.
+// Secondary zones are ignored for all signal logic.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Hard filter — discard before scoring
+function passesHardFilter(z, m5Candles) {
+  // 1. Minimum touch count
+  if ((z.totalTouches || 0) < 3) return { pass: false, reason: 'touches < 3 (' + (z.totalTouches||0) + ')' };
+  // 2. Zero-width zone
+  if (!z.minPrice || !z.maxPrice || z.minPrice === z.maxPrice)
+    return { pass: false, reason: 'zero-width zone' };
+  // 3. Zone age — last touch within 150 candles
+  const candlesSinceLast = (m5Candles.length - 1) - (z.lastCandleIdx || 0);
+  if (candlesSinceLast > 150) return { pass: false, reason: 'too old (' + candlesSinceLast + ' candles)' };
+  return { pass: true };
+}
+
+// Zone scoring model — 0 to 100
+function rankZone(z, price, sess, m5Candles) {
+  const breakdown = {};
+  let total = 0;
+
+  // ── A. TOUCH COUNT (max 30) ───────────────────────────────────
+  const touches = z.totalTouches || 0;
+  const touchScore = touches >= 15 ? 30
+                   : touches >= 10 ? 24
+                   : touches >= 6  ? 18
+                   : touches >= 3  ? 10 : 0;
+  breakdown.touches = { score: touchScore, max: 30, count: touches };
+  total += touchScore;
+
+  // ── B. RECENCY (max 20) ───────────────────────────────────────
+  const recent20Len = Math.min(m5Candles.length, 20);
+  const candlesSinceLast = recent20Len - 1 - (z.lastCandleIdx || 0);
+  const recencyScore = candlesSinceLast <= 20  ? 20
+                     : candlesSinceLast <= 50  ? 12
+                     : candlesSinceLast <= 100 ? 6 : 0;
+  breakdown.recency = { score: recencyScore, max: 20, candlesSinceLast };
+  total += recencyScore;
+
+  // ── C. REACTION STRENGTH (max 20) ────────────────────────────
+  // Use avgWick relative to average candle range
+  const avgCandle = m5Candles.slice(-20).reduce((s,c) => s + range(c), 0) / Math.min(m5Candles.length, 20);
+  const wickRatio = avgCandle > 0 ? (z.avgWick || 0) / avgCandle : 0;
+  const reactionScore = wickRatio >= 1.5 ? 20
+                      : wickRatio >= 0.8 ? 12
+                      : wickRatio >= 0.3 ? 5 : 0;
+  breakdown.reaction = { score: reactionScore, max: 20, wickRatio: parseFloat(wickRatio.toFixed(2)) };
+  total += reactionScore;
+
+  // ── D. ZONE TIGHTNESS (max 15) ────────────────────────────────
+  const refPrice = z.minPrice || price;
+  const widthPct = refPrice > 0 ? (z.maxPrice - z.minPrice) / refPrice : 0;
+  const tightScore = widthPct <= 0.001 ? 15
+                   : widthPct <= 0.0025 ? 10
+                   : widthPct <= 0.005  ? 5 : 0;
+  breakdown.tightness = { score: tightScore, max: 15, widthPct: parseFloat((widthPct*100).toFixed(3)) };
+  total += tightScore;
+
+  // ── E. CONFLUENCE (max 15) ────────────────────────────────────
+  let confScore = 0;
+  // Round number confluence — does the zone overlap a 00 or 50 handle?
+  const zoneCenter = (z.minPrice + z.maxPrice) / 2;
+  const roundFifty = Math.round(zoneCenter / 50) * 50;
+  if (Math.abs(zoneCenter - roundFifty) / zoneCenter < 0.002) {
+    confScore += 5; breakdown.confluence_round = true;
+  }
+  // Session level confluence — score keeps track of PDH/PDL/ASH/ASL proximity
+  // (passed in via the levels array from buildLevels — checked at call site)
+  breakdown.confluence = { score: Math.min(confScore, 15), max: 15 };
+  total += Math.min(confScore, 15);
+
+  total = Math.min(Math.max(Math.round(total), 0), 100);
+  const grade = total >= 80 ? 'HIGH' : total >= 60 ? 'MEDIUM' : total >= 40 ? 'LOW' : 'IGNORE';
+  const emoji = total >= 80 ? '🟢' : total >= 60 ? '🟡' : '🔴';
+
+  return { total, grade, emoji, breakdown };
+}
+
+// Legacy wrapper — used by existing code that calls scoreZone()
+function scoreZone(z, price, sess) {
+  return rankZone(z, price, sess, []);
+}
+
+
+// ── ZONE RANKING ENGINE — selects ONE primary zone per symbol ───────────────
+function selectPrimaryZone(levels, price, sess, m5Candles, structuralBias) {
+  const m5 = m5Candles || [];
+  // structuralBias: { dir: 'BUY'|'SELL'|null, stage: 'sweep'|'move'|'trend'|null }
+  // If set, the opposite direction zone cannot become primary unless structure confirms
+
+  // 1. Pull only EQH/EQL clustered zones
+  const zones = levels.filter(l => l.isZone && (l.type === 'EQH' || l.type === 'EQL'));
+  if (!zones.length) return null;
+
+  // 2. Hard filter — discard invalid zones before scoring
+  const valid = [];
+  for (const z of zones) {
+    const hf = passesHardFilter(z, m5);
+    if (!hf.pass) {
+      console.log('[zone] DISCARD ' + z.type + ' ' + z.priceRange + ': ' + hf.reason);
+      continue;
+    }
+    valid.push(z);
+  }
+  if (!valid.length) return null;
+
+  // 3. Score + add confluence from structural levels (PDH/PDL/ASH/ASL)
+  const structural = levels.filter(l => ['PDH','PDL','ASH','ASL'].includes(l.type));
+  const scored = valid.map(z => {
+    const direction = getZoneDirection(z);
+    const nearEdge  = direction === 'SELL' ? z.minPrice : z.maxPrice;
+    const distPct   = Math.abs(price - nearEdge) / nearEdge;
+    const inside    = price >= z.minPrice && price <= z.maxPrice;
+
+    // Run ranking model
+    const confidence = rankZone(z, price, sess, m5);
+
+    // Confluence bonus: add +5 for each nearby structural level (within 0.2%)
+    let confBonus = 0;
+    for (const sl of structural) {
+      if (Math.abs(sl.price - z.price) / z.price <= 0.002) {
+        confBonus = Math.min(confBonus + 5, 15);
+      }
+    }
+    if (confBonus > 0) {
+      confidence.total = Math.min(confidence.total + confBonus, 100);
+      confidence.breakdown.confluence = { score: confBonus, sources: structural
+        .filter(sl => Math.abs(sl.price - z.price) / z.price <= 0.002)
+        .map(sl => sl.type) };
+    }
+
+    // Debug log for every valid zone
+    console.log('[zone] ' + z.type + ' ' + z.priceRange +
+      ' score=' + confidence.total + '/100' +
+      ' touches=' + z.totalTouches +
+      ' recency=' + confidence.breakdown.recency?.candlesSinceLast + 'c' +
+      ' reaction=' + confidence.breakdown.reaction?.wickRatio + 'x' +
+      ' tight=' + confidence.breakdown.tightness?.widthPct + '%' +
+      (confBonus ? ' +' + confBonus + ' confluence' : ''));
+
+    return { ...z, direction, distPct: parseFloat((distPct*100).toFixed(3)),
+             inside, confidence, score: confidence.total };
+  });
+
+  // 4. Apply structural bias — block opposite direction zones from becoming primary
+  // unless bias is only at 'sweep' level (weakest) and no opposing zone is stronger
+  if (structuralBias && structuralBias.dir) {
+    const biasDir       = structuralBias.dir;
+    const biasStage     = structuralBias.stage || 'sweep';
+    const oppositeDir   = biasDir === 'BUY' ? 'SELL' : 'BUY';
+    const stageStrength = { sweep: 1, move: 2, trend: 3 };
+    const biasStrength  = stageStrength[biasStage] || 1;
+
+    scored.forEach(z => {
+      if (z.direction === oppositeDir) {
+        // Counter-trend zone — demote unless bias is only at sweep level
+        if (biasStrength >= 2) {
+          // Move or trend confirmed — strongly suppress counter-trend zone
+          z.score        = Math.max(0, z.score - 40);
+          z.isCounterTrend = true;
+          console.log('[bias] ' + oppositeDir + ' zone ' + z.priceRange +
+            ' demoted (counter-trend — ' + biasDir + ' bias at ' + biasStage + ' stage)');
+        } else {
+          // Only sweep confirmed — moderate suppression
+          z.score        = Math.max(0, z.score - 20);
+          z.isCounterTrend = true;
+          console.log('[bias] ' + oppositeDir + ' zone ' + z.priceRange +
+            ' mildly demoted (counter-trend — ' + biasDir + ' sweep only)');
+        }
+      }
+    });
+  }
+
+  // 4. Sort by score descending — highest score = primary zone
+  scored.sort((a, b) => b.score - a.score);
+
+  const primary = scored[0];
+  if (primary.isCounterTrend) {
+    console.log('[bias] WARNING: primary zone is counter-trend — no same-direction zone available');
+  }
+  console.log('[zone] PRIMARY ZONE SELECTED: ' + primary.direction +
+    ' ' + primary.priceRange +
+    ' score=' + primary.score + '/100' +
+    ' touches=' + primary.totalTouches);
+
+  // Mark others as secondary (for debug/UI only — signal logic ignores them)
+  scored.slice(1).forEach(z => {
+    console.log('[zone] SECONDARY (ignored): ' + z.type + ' ' + z.priceRange + ' score=' + z.score);
+  });
+
+  return primary;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIFIED DIRECTION FUNCTION
+// Single source of truth for zone→direction mapping.
+// Called everywhere a direction needs to be inferred from a level/zone type.
+// ═══════════════════════════════════════════════════════════════════════════
+function getZoneDirection(lvl) {
+  if (!lvl) return null;
+  const t = lvl.type || '';
+  if (t === 'EQH' || t === 'PDH' || t === 'ASH') return 'SELL';
+  if (t === 'EQL' || t === 'PDL' || t === 'ASL') return 'BUY';
+  // For manually set zoneType
+  if (lvl.zoneType === 'sell_zone') return 'SELL';
+  if (lvl.zoneType === 'buy_zone')  return 'BUY';
+  // Last resort — level already has a corrected direction
+  return lvl.direction || null;
+}
+
+// ─── GLOBAL DIRECTIONAL BIAS ─────────────────────────────────────────────────
+// Weights: BOS=+3/-3, displacement=+2/-2, sweep=+1/-1, proximity=+0.5/-0.5
+// biasScore > +1 → BUY  |  < -1 → SELL  |  -1..+1 → NEUTRAL
+// A confirmed setup direction always overrides proximity signals.
+const BIAS_WEIGHTS = { bos: 3, move: 2, sweep: 1, proximity: 0.5 };
+
+function calcGlobalBias(levels, livePrice, activeSetup) {
+  let score = 0;
+  const factors = [];
+
+  // 1. Active setup direction carries highest weight
+  if (activeSetup && activeSetup.active && !activeSetup.invalidated) {
+    const w = activeSetup.events?.trend ? BIAS_WEIGHTS.bos
+            : activeSetup.events?.move  ? BIAS_WEIGHTS.move
+            : activeSetup.events?.sweep ? BIAS_WEIGHTS.sweep
+            : 0;
+    const val = activeSetup.direction === 'BUY' ? w : -w;
+    score += val;
+    factors.push((activeSetup.direction === 'BUY' ? '+' : '') + val +
+      ' (' + activeSetup.stage + ' active)');
+  }
+
+  // 2. Price vs PDH/PDL — structural context
+  const pdh = levels.find(l => l.type === 'PDH');
+  const pdl = levels.find(l => l.type === 'PDL');
+  if (pdh && livePrice > pdh.price) {
+    score -= BIAS_WEIGHTS.proximity;
+    factors.push('-' + BIAS_WEIGHTS.proximity + ' (above PDH → bearish context)');
+  } else if (pdl && livePrice < pdl.price) {
+    score += BIAS_WEIGHTS.proximity;
+    factors.push('+' + BIAS_WEIGHTS.proximity + ' (below PDL → bullish context)');
+  }
+
+  const bias = score > 1  ? 'BUY'
+             : score < -1 ? 'SELL'
+             :               'NEUTRAL';
+
+  console.log('[bias] Score: ' + score.toFixed(1) + ' → ' + bias +
+    (factors.length ? ' (' + factors.join(', ') + ')' : ''));
+
+  return { score, bias, factors };
+}
+
 function detectSweepPotential(price, approachingLevels, candles) {
   if (!approachingLevels.length || candles.length < 4) return [];
-  const last3    = candles.slice(-3);
-  const momentum = last3[last3.length - 1].c - last3[0].c;
-  const alerts   = [];
+  const alerts = [];
+
   for (const lvl of approachingLevels) {
-    const movingToward =
-      (lvl.side === 'below' && momentum < 0) ||
-      (lvl.side === 'above' && momentum > 0);
-    if (movingToward) {
-      const dir = lvl.side === 'below' ? 'BUY' : 'SELL';
-      alerts.push({
-        type:      'sweep_potential',
-        level:     lvl,
-        direction: dir,
-        message:   'Price approaching ' + lvl.label + ' at $' + lvl.price.toFixed(3) +
-                   ' (' + lvl.distPct + '% away) - potential ' + dir + ' sweep forming'
-      });
-    }
+    // Hard direction rule — never conflict
+    // EQH = equal highs = SELL zone (price sweeps UP, reverses DOWN)
+    // EQL = equal lows  = BUY  zone (price sweeps DOWN, reverses UP)
+    // PDH/ASH           = SELL (resistance above)
+    // PDL/ASL           = BUY  (support below)
+    const dir = getZoneDirection(lvl) || (lvl.side === 'below' ? 'BUY' : 'SELL');
+
+    const lvlDesc = lvl.isZone
+      ? 'Primary ' + dir + ' Zone $' + parseFloat(lvl.minPrice).toFixed(2) + '–$' + parseFloat(lvl.maxPrice).toFixed(2) +
+        ' (' + lvl.totalTouches + ' touches)'
+      : lvl.label + ' at $' + lvl.price.toFixed(3);
+
+    alerts.push({
+      type:      'sweep_potential',
+      level:     { ...lvl, direction: dir }, // enforce direction on level object too
+      direction: dir,
+      message:   lvlDesc + ' (' + lvl.distPct + '% away)'
+    });
   }
   return alerts;
 }
@@ -316,7 +950,7 @@ function detectSweepPotential(price, approachingLevels, candles) {
 // Returns: { found, candleIdx, level, direction, wickPct }
 function detectSweep(candles, levels) {
   const SWEEP_BREAK  = 0.0002; // 0.02% minimum penetration
-  const WICK_MIN_PCT = 0.30;   // wick >= 30% of total range
+  const WICK_MIN_PCT = 0.30;
 
   for (let i = candles.length - 6; i < candles.length; i++) {
     if (i < 0) continue;
@@ -325,23 +959,32 @@ function detectSweep(candles, levels) {
     if (totalRange === 0) continue;
 
     for (const lvl of levels) {
+      // For zones: use minPrice/maxPrice bounds. For single levels: use price ± small buffer.
+      const isZone   = lvl.isZone === true;
+      const zoneLow  = isZone ? lvl.minPrice : lvl.price;
+      const zoneHigh = isZone ? lvl.maxPrice : lvl.price;
+      // Representative price for sweep calculations
       const p = lvl.price;
 
-      // BUY sweep: low breaks BELOW level by >= 0.02%, close BACK ABOVE
-      if (c.l < p * (1 - SWEEP_BREAK) && c.c > p) {
-        const wickSize = p - c.l;
+      // BUY sweep: candle wicks BELOW zone bottom, closes BACK ABOVE zone bottom
+      const sweepLow  = zoneLow  * (1 - SWEEP_BREAK);
+      const sweepHigh = zoneHigh * (1 + SWEEP_BREAK);
+
+      if (c.l < sweepLow && c.c > zoneLow) {
+        const wickSize = zoneLow - c.l;
         if (wickSize / totalRange >= WICK_MIN_PCT) {
           return { found: true, candleIdx: i, level: lvl, direction: 'BUY',
-                   sweepExtreme: c.l, closePrice: c.c, wickPct: wickSize/totalRange };
+                   sweepExtreme: c.l, closePrice: c.c, wickPct: wickSize/totalRange,
+                   zoneMin: zoneLow, zoneMax: zoneHigh };
         }
       }
 
-      // SELL sweep: high breaks ABOVE level by >= 0.02%, close BACK BELOW
-      if (c.h > p * (1 + SWEEP_BREAK) && c.c < p) {
-        const wickSize = c.h - p;
+      if (c.h > sweepHigh && c.c < zoneHigh) {
+        const wickSize = c.h - zoneHigh;
         if (wickSize / totalRange >= WICK_MIN_PCT) {
           return { found: true, candleIdx: i, level: lvl, direction: 'SELL',
-                   sweepExtreme: c.h, closePrice: c.c, wickPct: wickSize/totalRange };
+                   sweepExtreme: c.h, closePrice: c.c, wickPct: wickSize/totalRange,
+                   zoneMin: zoneLow, zoneMax: zoneHigh };
         }
       }
     }
@@ -352,7 +995,9 @@ function detectSweep(candles, levels) {
 // ─── DISPLACEMENT ──────────────────────────────────────────────────────────
 // Must occur within 1–3 candles after sweep candle
 // Returns: { found, candleIdx, bodySize, avgBody }
-function detectDisplacement(candles, sweepIdx, direction) {
+function detectDisplacement(candles, sweepIdx, direction, minRatioOverride) {
+  // minRatioOverride: optional — allows caller to require stricter displacement
+  const MIN_RATIO_OVERRIDE = minRatioOverride || null;
   // Scans up to 4 candles. Tolerates 1 weak/indecisive candle gap.
   const BODY_MULT  = 1.5;
   const CLOSE_ZONE = 0.25;
@@ -369,7 +1014,8 @@ function detectDisplacement(candles, sweepIdx, direction) {
     const r = range(c);
     if (r === 0) continue;
     const dirOk      = direction === 'BUY' ? c.c > c.o : c.c < c.o;
-    const bodyStrong = b >= avgBody10 * BODY_MULT;
+    const _dispMin   = MIN_RATIO_OVERRIDE || BODY_MULT;
+    const bodyStrong = b >= avgBody10 * _dispMin;
     const closeZone  = direction === 'BUY'
       ? (c.c - c.l) / r >= (1 - CLOSE_ZONE)
       : (c.h - c.c) / r >= (1 - CLOSE_ZONE);
@@ -525,6 +1171,154 @@ function detectPullback(candles, dispIdx, direction, sweepExtreme) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SIGNAL QUALITY FILTERS — each returns { pass, reason }
+// All must pass before a full signal is generated.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// F1: DISPLACEMENT TIMING — must occur within 1-3 candles (strict), 4th only with no gap
+function filterDisplacementTiming(disp, sweepIdx) {
+  const offset = disp.candleIdx - sweepIdx;
+  if (offset <= 3) return { pass: true };
+  if (offset === 4 && !disp.weakGap)
+    return { pass: true, note: 'offset 4 — no gap, acceptable' };
+  return { pass: false,
+    reason: 'Displacement too delayed (' + offset + ' candles after sweep, max 3)' };
+}
+
+// F2: DISPLACEMENT CHOP — reject slow drifts, require clean single-candle impulse
+function filterDisplacementClean(candles, disp, avgRange) {
+  const c = candles[disp.candleIdx];
+  const b = body(c), r = range(c);
+  if (r === 0) return { pass: false, reason: 'Displacement candle has zero range' };
+  // Body must be > 60% of candle range (not a doji or long-wick chop)
+  if (b / r < 0.55)
+    return { pass: false, reason: 'Displacement body/range ' + (b/r*100).toFixed(0) + '% — too choppy (min 55%)' };
+  // Range must be >= average candle range (not a tiny move)
+  if (r < avgRange * 0.8)
+    return { pass: false, reason: 'Displacement range too small vs average' };
+  return { pass: true };
+}
+
+// F3: BOS QUALITY — close-only confirmation required; reject micro-breaks
+function filterBOSQuality(bos) {
+  // Method B (wick+followthrough) is less clean — downgrade but allow
+  // However: reject if structure_type is external AND method is wick+followthrough
+  // (weakest possible BOS — external swing + wick break = too noisy)
+  if (bos.structure_type === 'external' && bos.method === 'wick+followthrough')
+    return { pass: false,
+      reason: 'BOS too weak — external swing + wick-only break rejected' };
+  // BOS_MIN is already 0.05% in detectBOS — no additional check needed here
+  return { pass: true };
+}
+
+// F4: PULLBACK REJECTION CANDLE — must be genuine reversal, not flat
+function filterPullbackRejection(candles, disp, direction) {
+  // Find the pullback candle (most recent candle in zone)
+  // detectPullback already checks c.c > c.o (BUY) and lower wick > 15%
+  // Add: wick must be at least 20% of range AND body must be > 20% of range
+  // (rejects doji and spinning tops as pullback candles)
+  const pb = candles[disp.candleIdx + 1]; // first candle after displacement
+  if (!pb) return { pass: true }; // can't check yet
+  const b = body(pb), r = range(pb);
+  if (r === 0) return { pass: true };
+  // Not a flat/doji candle
+  if (b / r < 0.20) {
+    // Note: this is informational — detectPullback handles the real check
+    // We log but don't hard-reject here since pullback may not have formed yet
+    return { pass: true, note: 'First candle after disp is flat — pullback forming' };
+  }
+  return { pass: true };
+}
+
+// F5: OVEREXTENSION — reject if displacement already travelled > 2.5x avg range
+function filterOverextension(candles, disp, avgRange) {
+  if (!avgRange || avgRange === 0) return { pass: true };
+  const c = candles[disp.candleIdx];
+  const moveSize = range(c);
+  ratio = moveSize / avgRange;
+  if (ratio > 2.5)
+    return { pass: false,
+      reason: 'Move overextended — ' + ratio.toFixed(1) + 'x avg range (max 2.5x). Entry too late.' };
+  return { pass: true, extensionRatio: ratio.toFixed(2) };
+}
+
+// F6: OPPOSING LIQUIDITY — reject if strong opposing level is very close to TP1
+function filterOpposingLiquidity(direction, entry, tp1, levels) {
+  const riskDist = Math.abs(tp1 - entry);
+  if (riskDist === 0) return { pass: true };
+  // Find opposing levels between entry and TP1
+  const opposing = levels.filter(l => {
+    if (direction === 'BUY')  return l.price > entry && l.price < tp1;
+    return l.price < entry && l.price > tp1;
+  });
+  // Strong opposing level (PDH/PDL or EQH/EQL x3+) within 30% of the move = problematic
+  const blocked = opposing.filter(l => {
+    const lvlPrice = l.isZone ? (direction === 'BUY' ? l.minPrice : l.maxPrice) : l.price;
+    return (l.type === 'PDH' || l.type === 'PDL' || (l.strengthScore && l.strengthScore >= 2)) &&
+           Math.abs(lvlPrice - entry) / riskDist < 0.35;
+  });
+  if (blocked.length > 0)
+    return { pass: false,
+      reason: 'Strong opposing liquidity (' + blocked[0].label + ' @ $' + blocked[0].price.toFixed(2) + ') blocks TP1 path' };
+  return { pass: true };
+}
+
+// F7: SESSION STRENGTH — full signals only during active London/NY
+// (Already enforced by sessionOk check, but add explicit guard here)
+function filterSessionForEntry(sess) {
+  if (!sess) return { pass: false, reason: 'No active session — entry not permitted' };
+  return { pass: true };
+}
+
+// F8: M15 DIRECTION ALIGNMENT — reject if M15 clearly contradicts trade direction
+function filterM15Alignment(m15Candles, direction) {
+  if (!m15Candles || m15Candles.length < 6) return { pass: true, note: 'Insufficient M15 data — skipping check' };
+  // Check last 3 M15 candles for clear directional contradiction
+  const recent = m15Candles.slice(-3);
+  let bullCount = 0, bearCount = 0;
+  recent.forEach(c => { if (c.c > c.o) bullCount++; else bearCount++; });
+  // If all 3 recent M15 candles oppose direction AND we are not in BOS confirmation context
+  // → hard reject
+  if (direction === 'BUY'  && bearCount === 3)
+    return { pass: false, reason: 'M15 clearly bearish (3/3 candles) — contradicts BUY direction' };
+  if (direction === 'SELL' && bullCount === 3)
+    return { pass: false, reason: 'M15 clearly bullish (3/3 candles) — contradicts SELL direction' };
+  return { pass: true, m15Bias: bullCount > bearCount ? 'bullish' : bearCount > bullCount ? 'bearish' : 'neutral' };
+}
+
+// Run all quality filters — returns { pass, failedFilter, reason, notes }
+function runQualityFilters(candles, m15Candles, sweep, disp, bos, pullback,
+                            levels, direction, entry, tp1, sess, avgRange) {
+  const notes = [];
+
+  const f1 = filterDisplacementTiming(disp, sweep.candleIdx);
+  if (!f1.pass) return { pass: false, failedFilter: 'F1_DISPLACEMENT_TIMING', reason: f1.reason };
+  if (f1.note) notes.push(f1.note);
+
+  const f2 = filterDisplacementClean(candles, disp, avgRange);
+  if (!f2.pass) return { pass: false, failedFilter: 'F2_DISPLACEMENT_CHOP', reason: f2.reason };
+
+  const f3 = filterBOSQuality(bos);
+  if (!f3.pass) return { pass: false, failedFilter: 'F3_BOS_QUALITY', reason: f3.reason };
+
+  const f5 = filterOverextension(candles, disp, avgRange);
+  if (!f5.pass) return { pass: false, failedFilter: 'F5_OVEREXTENSION', reason: f5.reason };
+  if (f5.extensionRatio) notes.push('Extension: ' + f5.extensionRatio + 'x avg range');
+
+  const f6 = filterOpposingLiquidity(direction, entry, tp1, levels);
+  if (!f6.pass) return { pass: false, failedFilter: 'F6_OPPOSING_LIQ', reason: f6.reason };
+
+  const f7 = filterSessionForEntry(sess);
+  if (!f7.pass) return { pass: false, failedFilter: 'F7_SESSION', reason: f7.reason };
+
+  const f8 = filterM15Alignment(m15Candles, direction);
+  if (!f8.pass) return { pass: false, failedFilter: 'F8_M15_ALIGN', reason: f8.reason };
+  if (f8.m15Bias) notes.push('M15 bias: ' + f8.m15Bias);
+
+  return { pass: true, notes };
+}
+
 // ─── STOP LOSS ─────────────────────────────────────────────────────────────
 function calcSL(direction, sweepExtreme, atr) {
   const PIP_BUFFER = direction === 'BUY'
@@ -572,103 +1366,176 @@ function checkVolatility(atrValues) {
   return { ok: true, currentATR, avg20 };
 }
 
-// ─── SCORING SYSTEM (0–100) ──────────────────────────────────────────────────
-// Six components. Each has a max score and hard-fail conditions.
-// A+ = 85+, A = 75-84, discard < 75.
+// ═══════════════════════════════════════════════════════════════════════════
+// CONFIDENCE SCORING SYSTEM (0–100)
+//
+// Components:
+//   A. Liquidity Strength   0–25  (zone touch count)
+//   B. Reaction Quality     0–20  (wick rejection strength)
+//   C. Displacement         0–20  (move strength after grab)
+//   D. Structure (BOS)      0–15  (trend shift quality)
+//   E. Pullback Quality     0–10  (entry zone refinement)
+//   F. Session Quality      0–10  (time-based weighting)
+//
+// Tiers:
+//   0–39   IGNORE  — do not display, no alerts
+//  40–59   LOW     — display only, no alerts
+//  60–74   VALID   — pre-signal Telegram allowed
+//  75–100  HIGH    — full signal allowed
+// ═══════════════════════════════════════════════════════════════════════════
 
 function scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
-                    volatilityOk, directionalBias, biasPenalty) {
+                    volatilityOk, directionalBias, biasPenalty, htfBias) {
+  // htfBias: 'BULLISH' | 'BEARISH' | 'NEUTRAL' (optional — defaults to NEUTRAL)
+  const _htfBias = htfBias || 'NEUTRAL';
 
   const breakdown = {};
   let total = 0;
 
-  // ── 1. SESSION QUALITY (max 20) ──────────────────────────────
-  if (!sessionOk) return { total: 0, grade: 'REJECT', reason: 'Outside session', breakdown: {} };
-  const sessScore = sessionLabel === 'London+NY Overlap' ? 20
-                  : sessionLabel === 'New York'           ? 16
-                  : sessionLabel === 'London'             ? 13 : 0;
-  breakdown.session = { score: sessScore, max: 20, label: sessionLabel };
+  // Hard exits — cannot score without these fundamentals
+  if (!sessionOk)        return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'Outside session',   breakdown: {} };
+  if (!sweep || !sweep.found) return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'No sweep',     breakdown: {} };
+
+  // ── A. LIQUIDITY STRENGTH (max 25) ───────────────────────────
+  // Based on zone touch count (totalTouches for clustered zones, strengthScore for singles)
+  const touches = sweep.level
+    ? (sweep.level.totalTouches || (sweep.level.strengthScore >= 3 ? 6 : sweep.level.strengthScore >= 2 ? 3 : 2))
+    : 2;
+  const liqScore = touches >= 10 ? 25
+                 : touches >= 6  ? 22
+                 : touches >= 4  ? 18
+                 : touches === 3 ? 15
+                 :                 10; // 2 touches minimum
+  // Level type bonus: PDH/PDL = premium liquidity
+  const liqBonus = (sweep.level?.type === 'PDH' || sweep.level?.type === 'PDL') ? 3
+                 : (sweep.level?.type === 'ASH' || sweep.level?.type === 'ASL') ? 1 : 0;
+  const liqFinal = Math.min(liqScore + liqBonus, 25);
+  breakdown.liquidity = { score: liqFinal, max: 25, touches, label: sweep.level?.label || '—' };
+  total += liqFinal;
+
+  // ── B. REACTION QUALITY (max 20) ─────────────────────────────
+  // How cleanly did price reject the zone (wick size + close quality)
+  const wickPct = sweep.wickPct || 0;
+  const reactionScore = wickPct >= 0.70 ? 20   // very strong rejection + full close back
+                      : wickPct >= 0.55 ? 17   // clean wick rejection
+                      : wickPct >= 0.40 ? 14   // decent rejection
+                      : wickPct >= 0.30 ? 10   // minimum valid wick
+                      : 5;                     // below threshold (already filtered, but score low)
+  // Bonus if close was strongly back inside (not just at level)
+  const closeBonus = sweep.closePrice && sweep.level
+    ? (Math.abs(sweep.closePrice - sweep.level.price) / sweep.level.price > 0.001 ? 2 : 0)
+    : 0;
+  const reactionFinal = Math.min(reactionScore + closeBonus, 20);
+  breakdown.reaction = { score: reactionFinal, max: 20, wickPct: Math.round(wickPct * 100) };
+  total += reactionFinal;
+
+  // ── C. DISPLACEMENT / STRONG MOVE (max 20) ───────────────────
+  if (!displacement || !displacement.found) {
+    breakdown.displacement = { score: 0, max: 20, note: 'No displacement detected' };
+    // Not a hard fail for scoring — keeps partial scores for pre-signal use
+  } else {
+    const dispScore = displacement.ratio >= 3.0 ? 20
+                    : displacement.ratio >= 2.5 ? 18
+                    : displacement.ratio >= 2.0 ? 15
+                    : displacement.ratio >= 1.5 ? 11
+                    : 6;
+    const dispFinal = displacement.weakGap ? Math.max(dispScore - 3, 5) : dispScore;
+    breakdown.displacement = { score: dispFinal, max: 20, ratio: displacement.ratio };
+    total += dispFinal;
+  }
+
+  // ── D. STRUCTURE BREAK / BOS (max 15) ────────────────────────
+  if (!bos || !bos.found) {
+    breakdown.structure = { score: 0, max: 15, note: 'No BOS detected' };
+  } else {
+    const bosScore = bos.structure_type === 'internal' && bos.method === 'close' ? 15
+                   : bos.structure_type === 'internal'                            ? 13
+                   : bos.method === 'close'                                       ? 11
+                   : 8;
+    breakdown.structure = { score: bosScore, max: 15, type: bos.structure_type, method: bos.method };
+    total += bosScore;
+  }
+
+  // ── E. PULLBACK QUALITY (max 10) ─────────────────────────────
+  if (!pullback || !pullback.found) {
+    breakdown.pullback = { score: 0, max: 10, note: 'No pullback yet' };
+  } else {
+    const pb = parseFloat(pullback.retracement);
+    if (pb > 70) return { total: 0, tier: 'IGNORE', grade: 'IGNORE', reason: 'Pullback > 70%', breakdown };
+    const pbScore = (pb >= 50 && pb <= 61.8) ? 10
+                  : (pb >= 45 && pb <  50)    ? 7
+                  : (pb >  61.8 && pb <= 70)  ? 5
+                  : 3;
+    breakdown.pullback = { score: pbScore, max: 10, retracement: pb };
+    total += pbScore;
+  }
+
+  // ── F. SESSION QUALITY (max 10) ──────────────────────────────
+  const sessScore = sessionLabel === 'London+NY Overlap' ? 10
+                  : sessionLabel === 'New York'           ? 8
+                  : sessionLabel === 'London'             ? 6
+                  : 0;
+  breakdown.session = { score: sessScore, max: 10, label: sessionLabel || 'Unknown' };
   total += sessScore;
 
-  // ── 2. LIQUIDITY QUALITY (max 20) ────────────────────────────
-  if (!sweep.found) return { total: 0, grade: 'REJECT', reason: 'No sweep', breakdown };
-  const liqScore = sweep.level
-    ? (sweep.level.type === 'PDH' || sweep.level.type === 'PDL' ? 20   // strongest levels
-    : sweep.level.type === 'ASH' || sweep.level.type === 'ASL'  ? 16
-    : sweep.level.strengthScore >= 3                            ? 14   // EQH/EQL x4+
-    : sweep.level.strengthScore >= 2                            ? 10   // x3
-    : 6)                                                               // x2 weak
-    : 6;
-  breakdown.liquidity = { score: liqScore, max: 20, label: sweep.level?.label || '—' };
-  total += liqScore;
-
-  // ── 3. SWEEP QUALITY (max 20) ────────────────────────────────
-  // Wick must be >= 30% of range (already enforced), score by wick size
-  const wickPct = sweep.wickPct || 0;
-  const sweepScore = wickPct >= 0.6 ? 20   // very clean sweep
-                   : wickPct >= 0.45 ? 16
-                   : wickPct >= 0.30 ? 12   // minimum valid
-                   : 0;                     // below minimum = hard fail
-  if (sweepScore === 0) return { total: 0, grade: 'REJECT', reason: 'Weak sweep wick', breakdown };
-  breakdown.sweep = { score: sweepScore, max: 20, wickPct: Math.round(wickPct*100) };
-  total += sweepScore;
-
-  // ── 4. DISPLACEMENT STRENGTH (max 15) ────────────────────────
-  if (!displacement.found) return { total: 0, grade: 'REJECT', reason: 'No displacement', breakdown };
-  const dispScore = displacement.ratio >= 2.5 ? 15
-                  : displacement.ratio >= 2.0 ? 13
-                  : displacement.ratio >= 1.5 ? 10   // minimum
-                  : 0;
-  if (dispScore === 0) return { total: 0, grade: 'REJECT', reason: 'Displacement too weak', breakdown };
-  const dispFinal = displacement.weakGap ? Math.max(dispScore - 3, 6) : dispScore;
-  breakdown.displacement = { score: dispFinal, max: 15, ratio: displacement.ratio, weakGap: displacement.weakGap };
-  total += dispFinal;
-
-  // ── 5. STRUCTURE BREAK (max 15) ──────────────────────────────
-  if (!bos.found) return { total: 0, grade: 'REJECT', reason: 'No BOS', breakdown };
-  const bosScore = bos.structure_type === 'internal' && bos.method === 'close' ? 15
-                 : bos.structure_type === 'internal'                            ? 13
-                 : bos.method === 'close'                                       ? 11
-                 : 9; // external + wick method = weakest valid
-  breakdown.structure = { score: bosScore, max: 15, type: bos.structure_type, method: bos.method };
-  total += bosScore;
-
-  // ── 6. PULLBACK QUALITY (max 10) ─────────────────────────────
-  if (!pullback.found) return { total: 0, grade: 'REJECT', reason: 'No pullback', breakdown };
-  const pb = parseFloat(pullback.retracement);
-  if (pb > 70) return { total: 0, grade: 'REJECT', reason: 'Pullback exceeded 70%', breakdown };
-  const pbScore = (pb >= 50 && pb <= 61.8) ? 10   // ideal Fibonacci zone
-                : (pb >= 45 && pb < 50)    ? 7    // slightly early
-                : (pb > 61.8 && pb <= 70)  ? 5    // late but valid
-                : 0;
-  if (pbScore === 0) return { total: 0, grade: 'REJECT', reason: 'Pullback outside valid zone', breakdown };
-  breakdown.pullback = { score: pbScore, max: 10, retracement: pb };
-  total += pbScore;
-
-  // ── VOLATILITY PENALTY ───────────────────────────────────────
+  // ── PENALTIES + HTF BIAS MODIFIER ───────────────────────────
   if (!volatilityOk) {
     total -= 8;
     breakdown.volatility = { penalty: -8 };
   }
-
-  // ── DIRECTIONAL BIAS PENALTY ─────────────────────────────────
   if (biasPenalty > 0 && sweep.found) {
     const isCounter = (directionalBias === 'bearish_bias' && sweep.direction === 'BUY') ||
                       (directionalBias === 'bullish_bias' && sweep.direction === 'SELL');
     if (isCounter) {
       total -= biasPenalty;
-      breakdown.bias = { penalty: -biasPenalty, note: 'Counter-trend' };
+      breakdown.bias = { penalty: -biasPenalty, note: 'Counter-trend setup' };
     }
   }
 
-  total = Math.min(Math.max(total, 0), 100);
-  const grade = total >= 85 ? 'A+' : total >= 75 ? 'A' : 'REJECT';
+  // ── HTF BIAS MODIFIER (confidence only — never blocks trade) ─
+  if (_htfBias !== 'NEUTRAL' && sweep.found) {
+    const dir = sweep.direction;
+    const htfAligned = (_htfBias === 'BULLISH' && dir === 'BUY') ||
+                       (_htfBias === 'BEARISH' && dir === 'SELL');
+    const htfCounter = (_htfBias === 'BULLISH' && dir === 'SELL') ||
+                       (_htfBias === 'BEARISH' && dir === 'BUY');
+    if (htfAligned) {
+      total += 10;
+      breakdown.htfBias = { adjustment: +10, alignment: 'ALIGNED', htfBias: _htfBias };
+      console.log('[htf] ' + dir + ' setup ALIGNED with ' + _htfBias + ' HTF bias → +10 confidence');
+    } else if (htfCounter) {
+      total -= 15;
+      breakdown.htfBias = { adjustment: -15, alignment: 'COUNTER', htfBias: _htfBias };
+      console.log('[htf] ' + dir + ' setup COUNTER to ' + _htfBias + ' HTF bias → -15 confidence');
+    }
+  }
 
-  return { total, grade, breakdown,
-           reason: grade === 'REJECT' ? 'Score ' + total + ' below threshold 75' : null };
+  total = Math.min(Math.max(Math.round(total), 0), 100);
+
+  // ── TIER CLASSIFICATION ───────────────────────────────────────
+  const tier  = total >= 75 ? 'HIGH'   // full signal allowed
+              : total >= 60 ? 'VALID'  // pre-signal Telegram allowed
+              : total >= 40 ? 'LOW'    // display only, no alerts
+              :               'IGNORE'; // discard
+  // Legacy grade compatibility
+  const grade = total >= 85 ? 'A+' : total >= 75 ? 'A' : total >= 60 ? 'B' : 'REJECT';
+
+  // Debug log
+  const bdStr = [
+    'Liq '  + liqFinal,
+    'React ' + reactionFinal,
+    'Move '  + (breakdown.displacement?.score || 0),
+    'BOS '   + (breakdown.structure?.score || 0),
+    'PB '    + (breakdown.pullback?.score || 0),
+    'Sess '  + sessScore
+  ].join(' + ');
+  console.log('[score] ' + (sweep.level?.label || '—') + ' → ' + total + '/100 (' + tier + ') = ' + bdStr);
+
+  return { total, tier, grade, breakdown,
+           reason: tier === 'IGNORE' ? 'Score ' + total + ' below threshold (40)' : null };
 }
 
-// Backwards-compatible wrapper used in /analyze route
+// Backwards-compatible wrapper — returns total score (number)
 function calcConfidence(sessionOk, sessionOverlap, volatilityOk, sweep, displacement, bos,
                         pullback, sweepLevel, sessionLabel, directionalBias, biasPenalty) {
   const result = scoreSetup(sessionLabel, sessionOk, sweep, displacement, bos, pullback,
@@ -853,13 +1720,42 @@ app.get('/analyze/:sym', async (req, res) => {
   const sym = req.params.sym.toUpperCase();
   if (!SYMBOLS[sym]) return res.status(400).json({ success:false, error:'Unknown symbol' });
 
+  // Server-side timeout — never hang longer than 20s regardless of API slowness
+  const routeTimeout = setTimeout(() => {
+    if (!res.headersSent) {
+      console.error('[' + sym + '] Route timeout — Twelve Data too slow, returning error');
+      res.json({ success: true, symbol: sym, price: null, atr: null,
+        system_state: 'data_error', session: 'Unknown', session_ok: false,
+        setup_state: 'standby', levels: [],
+        log: ['Live data temporarily unavailable — API timeout (>20s)'],
+        signal: null, m5_candles: 0 });
+    }
+  }, 20000);
+
+  // Ensure timeout is cleared when response finishes
+  res.on('finish', () => clearTimeout(routeTimeout));
+
   // ── 1. FETCH DATA ──────────────────────────────────────────────────────
+  // SLV early exit: if outside NYSE hours AND no cached data, skip fetch entirely
+  const _nowH = new Date().getUTCHours();
+  const _slvClosed = sym === 'XAGUSD' && (_nowH >= 20 || _nowH < 13);
+  if (_slvClosed) {
+    const _cached = getCached('candles_XAGUSD_5min_120');
+    const _lastPrice = _cached ? parseFloat(_cached[_cached.length-1]?.c) : null;
+    const _lastATR   = _cached ? calcATRFromCandles(_cached, 14) : [];
+    return res.json({ success: true, symbol: 'XAGUSD',
+      price: _lastPrice, atr: null,
+      volatility_atr: _lastATR.length ? parseFloat(_lastATR[_lastATR.length-1].toFixed(4)) : null,
+      system_state: 'session_closed', session: 'Closed',
+      session_ok: false, setup_state: 'standby',
+      levels: [], log: ['Silver market closed — SLV ETF trades 13:30–20:00 UTC.' + (_lastPrice ? ' Last price: $' + _lastPrice.toFixed(3) : '')],
+      signal: null, m5_candles: _cached?.length || 0,
+      note: 'SLV market closed. Opens 13:30 UTC.' });
+  }
+
   let m5, m15, atrValues;
   try {
     // ONE API call per symbol — everything else derived from M5 candles.
-    // M15 is derived by grouping M5 candles (3 M5 = 1 M15).
-    // ATR is calculated locally from candle data (Wilder's method).
-    // This keeps total calls at 2/scan (1 per symbol) — within free tier.
     m5 = await getCandles(sym, '5min', 120);  // 120 × 5min = 10 hours
 
     // Derive M15 and ATR without additional API calls
@@ -876,8 +1772,22 @@ app.get('/analyze/:sym', async (req, res) => {
       signal: null, m5_candles: 0 });
   }
 
+  // Pre-declare variables accessible in catch block and final response
+  livePrice = m5?.[m5.length-1]?.c || null;
+  setupState = 'idle';
+  signal = null;
+  near_setup = null;
+  approachingLevels = [];
+  sweepPotentials = [];
+  primaryZone = null;
+  pzConf = 0, pzGrade = 'IGNORE';
+  directionalBias = 'neutral', analyzeGlobalBias = { bias: 'NEUTRAL', score: 0 };
+  let ratio = null;
+
+  // ── SIGNAL ENGINE (fully wrapped — any crash returns a safe error response) ──
+  try {
+
   // ── SYSTEM STATE DETERMINATION ─────────────────────────────────────────────
-  // State is independent of session. Data issues ≠ session closed.
   const nowUtc   = Date.now();
   const utcHour  = new Date(nowUtc).getUTCHours();
   const inSession= (utcHour >= 7 && utcHour < 16) || (utcHour >= 13 && utcHour < 22);
@@ -908,13 +1818,27 @@ app.get('/analyze/:sym', async (req, res) => {
 
   // Check candle staleness — latest candle should be within 30 minutes
   const latestCandleAge = (nowUtc - m5[m5Count - 1].t) / 60000; // minutes
-  if (latestCandleAge > 30 && inSession) {
-    return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
-      system_state: 'data_error',
-      session: sessionName(nowUtc) || 'Active',
-      session_ok: true, setup_state: 'standby',
-      levels: [], log: ['Live data temporarily unavailable — latest candle is ' + Math.round(latestCandleAge) + ' minutes old'],
-      signal: null, m5_candles: m5Count });
+  if (latestCandleAge > 30) {
+    const isSLV     = sym === 'XAGUSD';
+    const slvClosed = isSLV && (utcHour >= 20 || utcHour < 13);
+    const staleMsg  = slvClosed
+      ? 'Silver market closed — SLV ETF trades 13:30–20:00 UTC. Last price: $' + m5[m5Count-1].c.toFixed(3)
+      : 'Live data temporarily unavailable — latest candle is ' + Math.round(latestCandleAge) + ' minutes old';
+    if (slvClosed) {
+      const lastATR = calcATRFromCandles(m5, 14);
+      return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
+        system_state: 'session_closed', session: 'Closed',
+        session_ok: false, setup_state: 'standby',
+        volatility_atr: lastATR.length ? parseFloat(lastATR[lastATR.length-1].toFixed(4)) : null,
+        m5_candles: m5Count, levels: [], log: [staleMsg], signal: null,
+        note: 'SLV market closed. Opens 13:30 UTC.' });
+    }
+    if (inSession) {
+      return res.json({ success: true, symbol: sym, price: m5[m5Count-1]?.c || null,
+        system_state: 'data_error', session: sessionName(nowUtc) || 'Active',
+        session_ok: false, setup_state: 'standby',
+        levels: [], log: [staleMsg], signal: null, m5_candles: m5Count });
+    }
   }
 
   // M15 low — warn but do not block
@@ -926,7 +1850,7 @@ app.get('/analyze/:sym', async (req, res) => {
   const currentATR    = atrValues?.length > 0 ? atrValues[atrValues.length-1] : null;
   const currentTS     = m5[m5.length-1].t;
   // Use current wall-clock UTC time for session detection, NOT candle timestamp.
-  // Candle timestamp can be stale (SLV closes at 20:00 UTC; last candle
+  // Candle timestamp — XAG/USD is 24/5 spot, stale data = API issue
   // would otherwise make London session appear closed next morning).
   const sess          = sessionName(Date.now());
   const sessionOk     = sess !== null;
@@ -937,25 +1861,27 @@ app.get('/analyze/:sym', async (req, res) => {
   // ── 3. VOLATILITY FILTER ──────────────────────────────────────────────
   const volatility = checkATR(sym, atrValues);
 
-  // --- DIRECTIONAL BIAS -------------------------------------------------------
-  // Light filter: adjusts confidence based on price vs PDH/PDL.
-  // Does NOT block trades — only weights.
-  let directionalBias = 'neutral';
-  let biasPenalty     = 0;
-  const pdhLevel = levels.find(l => l.type === 'PDH');
-  const pdlLevel = levels.find(l => l.type === 'PDL');
-  if (pdhLevel && currentPrice > pdhLevel.price) {
-    directionalBias = 'bearish_bias';  // price above PDH = prefer shorts
-    biasPenalty = 5;
-  } else if (pdlLevel && currentPrice < pdlLevel.price) {
-    directionalBias = 'bullish_bias';  // price below PDL = prefer longs
-    biasPenalty = 5;
-  }
+  // --- DIRECTIONAL BIAS — unified via calcGlobalBias() ----------------------
+  analyzeGlobalBias = calcGlobalBias(levels, currentPrice, null);
+  const htfResult     = calcHTFBias(m15);
+  console.log('[htf] ' + sym + ' (analyze): bias=' + htfResult.bias + ' — ' + htfResult.reason);
+  const directionalBias   = analyzeGlobalBias.bias === 'BUY'  ? 'bullish_bias'
+                          : analyzeGlobalBias.bias === 'SELL' ? 'bearish_bias'
+                          : 'neutral';
+  const biasPenalty = Math.abs(analyzeGlobalBias.score) >= 3 ? 8
+                    : Math.abs(analyzeGlobalBias.score) >= 2 ? 5
+                    : Math.abs(analyzeGlobalBias.score) >= 1 ? 3 : 0;
 
     // ── STATE MACHINE ─────────────────────────────────────────────────────
   let setupState  = 'idle';
   let signal      = null;
   const log       = [];
+
+  // ── PRIMARY ZONE SELECTION (before sweep detection) ────────────────────
+  // Must happen here so detectSweep can be locked to primary zone only.
+  // Prevents secondary zones from triggering conflicting signals.
+  const primaryZoneEarly = selectPrimaryZone(levels, currentPrice, sess, m5, null);
+  const sweepLevels = primaryZoneEarly ? [primaryZoneEarly] : [];
 
   if (!sessionOk) {
     setupState = 'idle';
@@ -964,15 +1890,21 @@ app.get('/analyze/:sym', async (req, res) => {
     setupState = 'idle';
     log.push('Volatility check: ' + volatility.note);
   } else {
-    // ── 4. SWEEP DETECTION ──────────────────────────────────────────────
-    const sweep = detectSweep(m5, levels);
+    // ── 4. SWEEP DETECTION — PRIMARY ZONE ONLY ──────────────────────────
+    let sweep = detectSweep(m5, sweepLevels); // locked to primary zone
+    if (sweep.found) sweep = correctSweepDirection(sweep); // enforce direction from zone type
 
     if (!sweep.found) {
       setupState = 'idle';
       log.push('No liquidity grab detected on current M5 data');
     } else {
       setupState = 'sweep_detected';
-      log.push('Liquidity grab: ' + sweep.direction + ' — price swept ' + sweep.level.label + ' at $' + sweep.level.price.toFixed(3) + ' (wick ' + (sweep.wickPct*100).toFixed(1) + '% of candle range)');
+      // Direction comes from zone type (correctSweepDirection enforces this)
+      const lvlDir = sweep.direction; // already corrected to match zone type
+      log.push('[Stage] Liquidity grab confirmed — ' + sweep.level.label + ' swept');
+      log.push('Liquidity grab: ' + lvlDir + ' — price swept ' + sweep.level.label +
+        ' at $' + sweep.level.price.toFixed(3) +
+        ' (wick ' + (sweep.wickPct*100).toFixed(1) + '% of candle range)');
 
       // ── 5. TIME DECAY CHECK: max 10 M5 candles for full setup ───────
       const sweepToNow = m5.length - 1 - sweep.candleIdx;
@@ -985,9 +1917,11 @@ app.get('/analyze/:sym', async (req, res) => {
 
         if (!disp.found) {
           setupState = 'sweep_detected';
+          log.push('[Stage] Liquidity grab confirmed — ' + sweep.level.label + ' swept');
           log.push('Strong move: not confirmed — ' + disp.reason);
         } else {
           setupState = 'displacement_confirmed';
+          log.push('[Stage] Strong move confirmed — ' + (disp ? disp.ratio : '?') + 'x body displacement');
           log.push('Strong move confirmed: ' + disp.ratio + 'x average candle size, ' + (disp.candleIdx - sweep.candleIdx) + ' candle(s) after the liquidity grab' + (disp.weakGap ? ' (one weak candle gap tolerated)' : ''));
 
           // ── 7. BOS ────────────────────────────────────────────────
@@ -999,6 +1933,7 @@ app.get('/analyze/:sym', async (req, res) => {
           } else {
             const m15bos = confirmBOS_M15(m15, sweep.direction, bos.bos_level);
             setupState = 'structure_break';
+          log.push('[Stage] Trend shift confirmed — ' + bos.label);
             log.push('Trend shift (M5): ' + bos.label);
             log.push('Trend shift (M15): ' + (m15bos ? 'also visible on 15-minute chart' : 'not visible on 15-minute chart — M5 confirmation used'));
 
@@ -1007,6 +1942,7 @@ app.get('/analyze/:sym', async (req, res) => {
 
             if (!pb.found) {
               setupState = 'waiting_pullback';
+          log.push('[Stage] Waiting for pullback into 50-61.8% zone');
               log.push('Pullback entry: ' + pb.reason);
             } else {
               setupState = 'entry_triggered';
@@ -1020,13 +1956,36 @@ app.get('/analyze/:sym', async (req, res) => {
                 setupState = 'invalidated';
                 log.push('Risk/Reward check: ' + tps.rr1 + ' — below the minimum 1:2 requirement. Setup not valid.');
               } else {
+                // ── QUALITY FILTERS ───────────────────────────────
+                const avgRange = candles.slice(-10).reduce((s,c) => s + range(c), 0) / 10;
+                const qf = runQualityFilters(m5, m15, sweep, disp, bos, pb,
+                  levels, sweep.direction, parseFloat(pb.entry.toFixed(3)), tps.tp1,
+                  sess, avgRange);
+                if (!qf.pass) {
+                  setupState = 'invalidated';
+                  log.push('Quality filter failed [' + qf.failedFilter + ']: ' + qf.reason);
+                } else {
+                  if (qf.notes && qf.notes.length) log.push('Quality notes: ' + qf.notes.join(' | '));
                 // ── 10. CONFIDENCE ────────────────────────────────
+                // Hard gate: only generate signal if we reached this point through all stages
+                // (sweep → displacement → BOS → pullback → quality filters)
+                // setupState tracks progression, signal only fires at entry_triggered
                 const confidence = calcConfidence(sessionOk, sessionOverlap, volatility.ok === true || volatility.ok === undefined, sweep, disp, bos, pb, sweep.level, sess, directionalBias, biasPenalty);
+                log.push('Stage progression: sweep ✓ → displacement ✓ → BOS ✓ → pullback ✓ → quality ✓');
                 log.push('Confidence score: ' + confidence + '/100');
 
-                if (confidence < 80) {
+                // Full signal requires HIGH tier (≥75). Grade: A+ ≥85, A ≥75.
+                const _htfBiasState = timing?.htfBias || 'NEUTRAL';
+        const scoreResult2 = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
+                  volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty,
+                  _htfBiasState);
+                // Zone score gate applies here too
+                if (!analyzeZoneAllowSignal) {
                   setupState = 'invalidated';
-                  log.push('Signal not generated — confidence score ' + confidence + ' is below the required minimum of 80.');
+                  log.push('Signal blocked — zone score ' + pzConf + '/100 < 60 (zone too weak)');
+                } else if (scoreResult2.tier !== 'HIGH') {
+                  setupState = 'invalidated';
+                  log.push('Signal not generated — score ' + confidence + '/100 tier=' + scoreResult2.tier + ' (requires HIGH ≥75)');
                 } else {
                   // ── SIGNAL GENERATED ──────────────────────────────
                   const reasonParts = [
@@ -1056,6 +2015,7 @@ app.get('/analyze/:sym', async (req, res) => {
                     take_profit_2:  tps.tp2,
                     rr:             tps.rr1,
                     confidence,
+                    tier:           scoreResult2.tier || (confidence >= 75 ? 'HIGH' : 'VALID'),
                     session:        sess,
                     reason:         reasonParts.join(' → '),
                     setup_type:     'Liquidity Sweep Reversal',
@@ -1100,70 +2060,126 @@ app.get('/analyze/:sym', async (req, res) => {
     }
   } catch(e) {}
 
-  // --- PROXIMITY + PRE-SIGNAL ALERTS ----------------------------------------
-  const approachingLevels = (levels.length && livePrice)
-    ? detectApproaching(livePrice, levels, sym)
-    : [];
-  const sweepPotentials = approachingLevels.length
+  // --- PRIMARY ZONE + PRE-SIGNAL ALERTS ------------------------------------
+  // primaryZone was already selected before sweep detection (primaryZoneEarly).
+  // Alias it here for the pre-signal and response sections.
+  const primaryZone = primaryZoneEarly;
+  const approachingLevels = primaryZone
+    ? [{ ...primaryZone,
+         distPct: primaryZone.distPct,
+         isPrimary: true }]
+    : detectApproaching(livePrice, levels.filter(l => l.type !== 'EQH' && l.type !== 'EQL'), sym).slice(0, 1);
+
+  // Gate pre-signals: only generate if zone confidence >= 40 (not IGNORE)
+  const pzConf  = primaryZone?.confidence?.total || 0;
+  pzGrade = primaryZone?.confidence?.grade || 'IGNORE';
+  if (primaryZone) {
+    log.push('[Zone] PRIMARY ' + primaryZone.direction + ' ZONE $' + primaryZone.priceRange +
+      ' score=' + pzConf + '/100 touches=' + primaryZone.totalTouches +
+      (pzConf >= 60 ? ' ✓' : ' ⚠ low'));
+  }
+  // Zone score gate for analyze route
+  // < 60  → no pre-signals, no signals
+  // 60–74 → pre-signals allowed, no aggressive entry
+  // ≥ 75  → full system
+  const analyzeZoneAllowAggressive = pzConf >= 75;
+  const analyzeZoneAllowSignal     = pzConf >= 60;
+  const sweepPotentials = (primaryZone && analyzeZoneAllowSignal && approachingLevels.length)
     ? detectSweepPotential(livePrice, approachingLevels, m5)
     : [];
+  if (!analyzeZoneAllowSignal && primaryZone) {
+    log.push('Zone score ' + pzConf + '/100 < 60 — signals suppressed (zone not strong enough)');
+  } else if (!analyzeZoneAllowAggressive && primaryZone) {
+    log.push('Zone score ' + pzConf + '/100 [60–74] — standard entry only, aggressive suppressed');
+  }
 
-  // Build near_setup alert based on furthest confirmed stage
+  // Build near_setup — always inherits direction from primary zone (no conflicts)
   let near_setup = null;
   if (sweepPotentials.length && setupState === 'idle') {
+    const sp  = sweepPotentials[0];
+    const dir = sp.direction; // direction already locked by zone type in detectSweepPotential
     near_setup = {
-      stage: 'approaching_liquidity',
-      message: sweepPotentials[0].message,
-      direction: sweepPotentials[0].direction,
-      level: sweepPotentials[0].level,
-      alert: formatPreSignalAlert('approaching_liquidity', sym, sweepPotentials[0].direction,
-               sweepPotentials[0].message, sweepPotentials[0].level, sess, directionalBias)
+      stage:       'approaching_liquidity',
+      message:     sp.message,
+      direction:   dir,
+      level:       sp.level,
+      zone_confidence: primaryZone?.confidence || null,
+      alert:       formatPreSignalAlert('approaching_liquidity', sym, dir,
+                     sp.message, sp.level, sess, directionalBias)
     };
   } else if (setupState === 'sweep_detected') {
     near_setup = {
-      stage: 'sweep_detected',
-      message: (sweep.level ? 'Sweep of ' + sweep.level.label + ' confirmed' : 'Sweep confirmed') + ' - awaiting displacement',
+      stage:     'sweep_detected',
+      message:   'Sweep of ' + (sweep.level?.label || 'key zone') + ' confirmed — awaiting strong move',
       direction: sweep.direction,
-      alert: formatPreSignalAlert('sweep_detected', sym, sweep.direction,
-               null, sweep.level, sess, directionalBias)
+      level:     sweep.level,
+      alert:     formatPreSignalAlert('sweep_detected', sym, sweep.direction,
+                   null, sweep.level, sess, directionalBias)
     };
   } else if (setupState === 'displacement_confirmed') {
     near_setup = {
-      stage: 'displacement_confirmed',
-      message: 'Displacement confirmed (' + (disp ? disp.ratio : '?') + 'x body) - awaiting BOS',
+      stage:     'displacement_confirmed',
+      message:   'Displacement confirmed (' + (disp ? disp.ratio : '?') + 'x body) — awaiting BOS',
       direction: sweep.direction,
-      alert: formatPreSignalAlert('displacement_confirmed', sym, sweep.direction,
-               null, null, sess, directionalBias)
+      alert:     formatPreSignalAlert('displacement_confirmed', sym, sweep.direction,
+                   null, null, sess, directionalBias)
     };
   } else if (setupState === 'structure_break') {
     near_setup = {
-      stage: 'structure_break',
-      message: 'BOS confirmed - awaiting pullback entry',
+      stage:     'structure_break',
+      message:   'Trend shift confirmed — awaiting pullback entry',
       direction: sweep.direction,
-      alert: formatPreSignalAlert('structure_break', sym, sweep.direction,
-               null, null, sess, directionalBias)
+      alert:     formatPreSignalAlert('structure_break', sym, sweep.direction,
+                   null, null, sess, directionalBias)
     };
   }
 
-  res.json({
-    success:      true,
-    symbol:       sym,
-    system_state: 'active',
-    price:        livePrice,
-    atr:          currentATR,
-    session:      sess || 'Closed',
-    session_ok:   sessionOk,
-    setup_state:  setupState,
-    levels:       levels.slice(0,8),
-    log,
-    signal,
-    near_setup,
-    approaching_levels: approachingLevels,
-    sweep_potentials: sweepPotentials,
-    directional_bias: directionalBias,
-    m5_candles:   m5.length,
-    ratio
-  });
+  } // end qf.pass
+
+  // ── ALWAYS send response — regardless of signal path taken ──────────────
+  if (!res.headersSent) {
+    res.json({
+      success:      true,
+      symbol:       sym,
+      system_state: 'active',
+      price:        livePrice,
+      atr:          currentATR,
+      session:      sess || 'Closed',
+      session_ok:   sessionOk,
+      setup_state:  setupState,
+      levels:       levels.slice(0,8),
+      log,
+      signal,
+      near_setup,
+      approaching_levels: approachingLevels,
+      sweep_potentials:  sweepPotentials,
+      primary_zone:      primaryZone,
+      zone_confidence:   pzConf,
+      zone_direction:    primaryZone?.direction || null,
+      zone_score_tier:   pzConf >= 75 ? 'FULL' : pzConf >= 60 ? 'STANDARD' : 'BLOCKED',
+      zone_grade:        pzGrade,
+      directional_bias:  directionalBias,
+      bias_score:        analyzeGlobalBias?.score || 0,
+      bias_label:        analyzeGlobalBias?.bias  || 'NEUTRAL',
+      htf_bias:          htfResult?.bias || 'NEUTRAL',
+      htf_last_bos:      htfResult?.lastBOS || 'NONE',
+      htf_reason:        htfResult?.reason || '',
+      m5_candles:   m5.length,
+      ratio
+    });
+  }
+
+  } catch(routeErr) {
+    console.error('[analyze] Unhandled error in signal engine:', routeErr.message, routeErr.stack?.split('\n').slice(0,3).join(' | '));
+    if (!res.headersSent) {
+      const _price = (typeof livePrice !== 'undefined' ? livePrice : null) || m5?.[m5?.length-1]?.c || null;
+      res.json({ success: true, symbol: sym, price: _price,
+        system_state: 'data_error', session: 'Unknown', session_ok: false,
+        setup_state: 'standby', levels: [],
+        log: ['Signal engine error — ' + routeErr.message],
+        signal: null, m5_candles: m5?.length || 0 });
+    }
+  }
 });
 
 // ─── PRICES ROUTE ─────────────────────────────────────────────────────────
@@ -1183,23 +2199,182 @@ app.get('/health', async (req, res) => {
 });
 
 app.get('/prices', (req, res) => {
-  // Serve prices from in-memory cache — zero API calls
-  // Cache is populated by /analyze calls; stale by at most 60s which is fine
+  // Serve prices from in-memory candle cache — zero API calls
   const xauCache = getCached('candles_XAUUSD_5min_120');
   const xagCache = getCached('candles_XAGUSD_5min_120');
   const xau = xauCache ? parseFloat(xauCache[xauCache.length-1]?.c) || null : null;
-  const xag = xagCache ? parseFloat(xagCache[xagCache.length-1]?.c) || null : null;
+  const slv = xagCache ? parseFloat(xagCache[xagCache.length-1]?.c) || null : null;
+
+  // SLV holds ~0.9300 troy oz of silver per share (IAU ratio, updated periodically)
+  // Convert SLV price → XAG spot price for an accurate Gold/Silver ratio
+  const SLV_OZ_RATIO = 0.9300;
+  const xagSpot = slv ? parseFloat((slv / SLV_OZ_RATIO).toFixed(3)) : null;
+
+  // Real XAU/XAG ratio (Gold/Silver ratio) — industry standard metric
+  const ratio = xau && xagSpot ? parseFloat((xau / xagSpot).toFixed(1)) : null;
+
   res.json({
-    success: true,
-    prices: { XAUUSD: xau, XAGUSD: xag },
-    ratio: xau && xag ? parseFloat((xau/xag).toFixed(2)) : null,
+    success:  true,
+    prices:   { XAUUSD: xau, XAGUSD: slv },   // XAGUSD shows SLV price as-is for display
+    xag_spot: xagSpot,                          // actual silver spot estimate
+    ratio,                                      // true XAU/XAG ratio
     from_cache: true,
     ts: new Date().toUTCString()
   });
 });
 
-// Keep-alive ping — call this from frontend every 4 min to prevent Railway sleep
+// Keep-alive ping
 app.get('/ping', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// Step-by-step analyze test — finds exactly where the route crashes
+app.get('/test-analyze/:sym', async (req, res) => {
+  const sym = (req.params.sym || 'XAUUSD').toUpperCase();
+  const steps = [];
+  try {
+    steps.push('1. starting');
+    const m5 = await getCandles(sym, '5min', 120);
+    steps.push('2. candles fetched: ' + (m5?.length || 0));
+    if (!m5 || m5.length < 50) return res.json({ ok: false, steps, error: 'insufficient candles' });
+
+    const m15 = deriveM15FromM5(m5);
+    steps.push('3. m15 derived: ' + m15.length);
+
+    const atrValues = calcATRFromCandles(m5, 14);
+    steps.push('4. atr calculated: ' + atrValues.length);
+
+    const levels = buildLevels(m5, m15);
+    steps.push('5. levels built: ' + levels.length);
+
+    const livePrice = m5[m5.length-1].c;
+    steps.push('6. livePrice: ' + livePrice);
+
+    const sess = sessionName(Date.now());
+    steps.push('7. session: ' + sess);
+
+    const primaryZone = selectPrimaryZone(levels, livePrice, sess, m5, null);
+    steps.push('8. primaryZone: ' + (primaryZone ? primaryZone.direction + ' ' + primaryZone.priceRange : 'null'));
+
+    const globalBias = calcGlobalBias(levels, livePrice, null);
+    steps.push('9. bias: ' + globalBias.bias);
+
+    const sweep = detectSweep(m5, primaryZone ? [primaryZone] : levels);
+    steps.push('10. sweep: ' + sweep.found);
+
+    res.json({ ok: true, steps, sym, livePrice, session: sess });
+  } catch(e) {
+    steps.push('ERROR: ' + e.message);
+    res.json({ ok: false, steps, error: e.message, stack: e.stack?.split('\n').slice(0,3) });
+  }
+});
+
+// ── GET /stats — setup analytics
+app.get('/stats', (req, res) => {
+  try {
+    const logs = readAllLogs();
+    const total        = logs.length;
+    const entries      = logs.filter(l => l.entryTriggered).length;
+    const invalidations= logs.filter(l => l.invalidated && !l.entryTriggered).length;
+    const withResult   = logs.filter(l => l.result);
+    const wins         = withResult.filter(l => l.result === 'TP1' || l.result === 'TP2').length;
+    const losses       = withResult.filter(l => l.result === 'SL').length;
+    const winRate      = withResult.length > 0 ? Math.round(wins / withResult.length * 100) : null;
+    const avgZoneScore = total > 0
+      ? parseFloat((logs.reduce((s,l) => s + (l.zone?.score||0), 0) / total).toFixed(1))
+      : null;
+    const conversionRate = total > 0 ? Math.round(entries / total * 100) : null;
+
+    // Per-session breakdown
+    const bySession = {};
+    for (const l of logs) {
+      const sess = l.session || 'UNKNOWN';
+      if (!bySession[sess]) bySession[sess] = { setups:0, entries:0, wins:0 };
+      bySession[sess].setups++;
+      if (l.entryTriggered) bySession[sess].entries++;
+      if (l.result === 'TP1' || l.result === 'TP2') bySession[sess].wins++;
+    }
+
+    // By direction
+    const byDir = { BUY:{setups:0,entries:0,wins:0}, SELL:{setups:0,entries:0,wins:0} };
+    for (const l of logs) {
+      const d = l.direction;
+      if (byDir[d]) {
+        byDir[d].setups++;
+        if (l.entryTriggered) byDir[d].entries++;
+        if (l.result === 'TP1' || l.result === 'TP2') byDir[d].wins++;
+      }
+    }
+
+    res.json({
+      totalSetups:      total,
+      entriesTriggered: entries,
+      invalidations,
+      winRate,
+      losses,
+      avgZoneScore,
+      conversionRate,
+      bySession,
+      byDirection:      byDir,
+      recentSetups:     logs.slice(-10).reverse(),
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /result — record trade outcome manually
+// Body: { setupId: string, result: "TP1"|"TP2"|"SL"|"BE" }
+app.post('/result', (req, res) => {
+  const { setupId, result } = req.body || {};
+  if (!setupId || !result) return res.status(400).json({ error: 'setupId and result required' });
+  if (!['TP1','TP2','SL','BE'].includes(result)) return res.status(400).json({ error: 'Invalid result' });
+  logTradeResult(setupId, result);
+  res.json({ ok: true, setupId, result });
+});
+
+// Test signal — fires a mock ENTRY_READY through the full Telegram formatter
+// Usage: GET /test-signal  (or /test-signal?dir=BUY)
+app.get('/test-signal', async (req, res) => {
+  const dir   = (req.query.dir || 'SELL').toUpperCase();
+  const asset = req.query.sym === 'XAGUSD' ? 'XAGUSD' : 'XAUUSD';
+  const isBuy = dir === 'BUY';
+
+  const mockSig = {
+    id:            'TEST_' + Date.now(),
+    asset,
+    direction:     dir,
+    entry:         isBuy ? 4430.50  : 4434.20,
+    live_price:    isBuy ? 4432.10  : 4434.20,
+    stop_loss:     isBuy ? 4421.00  : 4441.50,
+    take_profit_1: isBuy ? 4450.00  : 4418.00,
+    take_profit_2: isBuy ? 4465.00  : 4404.00,
+    rr:            '2.1',
+    confidence:    82,
+    grade:         'A',
+    tier:          'HIGH',
+    entry_mode:    'AGGRESSIVE',
+    session:       'London',
+    directional_bias: 'neutral',
+    sweep_level:   'Equal ' + (isBuy ? 'Lows' : 'Highs') + ' zone (15 touches)',
+    pullback_pct:  '54.2',
+    expiry:        '10:45 UTC',
+    primaryZone:   { low: isBuy ? 4425.00 : 4431.35, high: isBuy ? 4432.00 : 4438.79 },
+    scoreBreakdown: {
+      sweep:        { score: 17, wickPct: 70 },
+      displacement: { score: 13, ratio: 1.93 },
+      structure:    { score: 15, type: 'internal', method: 'close' },
+      pullback:     { score: 10, retracement: 54.2 }
+    }
+  };
+
+  const msg = formatTelegramSignal(mockSig);
+  // Show in response AND send to Telegram if configured
+  let tgSent = false;
+  if (TG_TOKEN && TG_CHAT_ID) {
+    await sendTelegram(msg);
+    tgSent = true;
+  }
+  res.json({ ok: true, tg_sent: tgSent, preview: msg });
+});
 
 // Debug endpoint — shows raw Twelve Data response for a symbol
 // Usage: /debug/XAUUSD or /debug/XAGUSD
@@ -1233,7 +2408,7 @@ app.get('/debug/:sym', async (req, res) => {
 });
 
 app.get('/', (req, res) => res.json({
-  status:'ok', version:'4.0',
+  status:'ok', version:'5.1',
   engine:'Liquidity Sweep — Pure Price Action (M5+M15)',
   rules: ['PDH/PDL/ASH/ASL/EQH/EQL levels','0.02% sweep break required','1.5× body displacement','M5+M15 BOS','50-61.8% pullback entry','min 1:2 RR','confidence ≥ 80','10-candle time decay']
 }));
@@ -1281,91 +2456,123 @@ async function sendTelegram(text) {
 
 // Format full signal for Telegram — includes grade, score, expiry
 function formatTelegramSignal(sig) {
-  const isBuy  = sig.direction === 'BUY';
-  const emoji  = isBuy ? '🟢' : '🔴';
-  const asset  = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
-  const grade  = sig.grade || (sig.confidence >= 85 ? 'A+' : 'A');
-  const gradeEmoji = grade === 'A+' ? '⭐' : '✅';
-  const alert  = sig.alert || {};
-  const expiry = alert.expiry || '—';
-  const bd     = sig.scoreBreakdown || {};
+  const isBuy   = sig.direction === 'BUY';
+  const dir     = sig.direction;
+  const asset   = sig.asset === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const dirEmoji = isBuy ? '🟢' : '🔴';
 
-  // Score breakdown lines
-  const bdLines = [];
-  if (bd.session)      bdLines.push('  Session:      ' + bd.session.score + '/20 (' + bd.session.label + ')');
-  if (bd.liquidity)    bdLines.push('  Liquidity:    ' + bd.liquidity.score + '/20 (' + bd.liquidity.label + ')');
-  if (bd.sweep)        bdLines.push('  Sweep:        ' + bd.sweep.score + '/20 (wick ' + bd.sweep.wickPct + '%)');
-  if (bd.displacement) bdLines.push('  Displacement: ' + bd.displacement.score + '/15 (' + bd.displacement.ratio + 'x body)');
-  if (bd.structure)    bdLines.push('  Structure:    ' + bd.structure.score + '/15 (' + bd.structure.type + ' ' + bd.structure.method + ')');
-  if (bd.pullback)     bdLines.push('  Pullback:     ' + bd.pullback.score + '/10 (' + bd.pullback.retracement + '% retrace)');
+  // ── Grade & mode ──────────────────────────────────────────────
+  const conf    = sig.confidence || 0;
+  const grade   = conf >= 85 ? 'A+' : conf >= 75 ? 'A' : conf >= 65 ? 'B' : 'C';
+  const gradeEmoji = conf >= 85 ? '⭐' : conf >= 75 ? '✅' : '🔵';
 
-  const biasMap = {
-    bullish_bias: '↑ Bullish — price below prior day low',
-    bearish_bias: '↓ Bearish — price above prior day high',
-    neutral:      'Neutral — within prior day range'
-  };
+  const modeKey = sig.entry_mode || 'STANDARD';
+  const modeStr = modeKey === 'AGGRESSIVE_EARLY' ? '⚡ EARLY'
+                : modeKey === 'AGGRESSIVE'        ? '🎯 STANDARD'
+                : '🚀 MOMENTUM';
+
+  // ── Entry zone ────────────────────────────────────────────────
+  const entryPrice  = sig.entry;
+  const livePrice   = sig.live_price || entryPrice;
+  const distFromEntry = livePrice && entryPrice
+    ? Math.abs(((livePrice - entryPrice) / entryPrice) * 100).toFixed(3)
+    : null;
+
+  // Zone range from primary zone if available
+  const zone = sig.primaryZone || sig.zone || null;
+  const zoneRange = zone
+    ? '$' + parseFloat(zone.low || zone.minPrice || entryPrice).toFixed(2) +
+      ' – $' + parseFloat(zone.high || zone.maxPrice || entryPrice).toFixed(2)
+    : '$' + entryPrice;
+
+  // ── Risk management ───────────────────────────────────────────
+  const sl     = sig.stop_loss;
+  const riskDist = Math.abs(entryPrice - sl);
+  // Risk % assumes 0.5% of account per trade (configurable)
+  const RISK_PCT = 0.5;
+
+  // ── Take profit ───────────────────────────────────────────────
+  const tp1 = sig.take_profit_1;
+  const tp2 = sig.take_profit_2;
+  const rr1 = sig.rr || (tp1 ? (Math.abs(tp1 - entryPrice) / riskDist).toFixed(1) : '—');
+
+  // ── Validity / invalidation ───────────────────────────────────
+  const validity = modeKey === 'AGGRESSIVE_EARLY'
+    ? 'Valid for 2 candles (10 min) — early entry window'
+    : 'Valid until zone $' + (zone ? parseFloat(zone.low||zone.minPrice||sl).toFixed(2) : parseFloat(sl).toFixed(2)) + ' breaks';
+
+  const invalidation = isBuy
+    ? 'Close below $' + sl + ' · Pullback > 70% · Time expiry'
+    : 'Close above $' + sl + ' · Pullback > 70% · Time expiry';
+
+  // ── Reason bullets ────────────────────────────────────────────
+  const bd = sig.scoreBreakdown || {};
+  const reasons = [];
+  if (sig.sweep_level) reasons.push('• ' + sig.sweep_level + ' swept');
+  if (bd.sweep)        reasons.push('• Rejection wick: ' + (bd.sweep.wickPct || '—') + '%');
+  if (bd.displacement) reasons.push('• Displacement: ' + (bd.displacement.ratio || '—') + '× avg body');
+  if (bd.structure)    reasons.push('• BOS: ' + (bd.structure.type || '') + ' (' + (bd.structure.method || '') + ')');
+  if (sig.pullback_pct)reasons.push('• Pullback: ' + sig.pullback_pct + '% retracement');
+  if (!reasons.length && sig.reason) reasons.push('• ' + sig.reason);
+  // v5.2: zone freshness label
+  if (sig.zoneFreshness) reasons.push('• Zone: ' + sig.zoneFreshness);
+
+  // ── Session ───────────────────────────────────────────────────
+  const sess = sig.session || '—';
+
+  // v5.2: ATR position sizing block
+  const atrBlock = formatATRBlock(sig.atr, entryPrice, sl);
 
   return [
-    emoji + ' <b>' + asset + ' ' + sig.direction + ' — ' + gradeEmoji + ' ' + grade + ' SETUP (' + sig.confidence + '/100)</b>',
+    dirEmoji + ' <b>' + asset + ' ' + dir + '</b>  ' + gradeEmoji + ' <b>' + grade + '</b>  ' + modeStr,
+    '─────────────────────────────',
     '',
-    '📋 <b>What happened:</b>',
-    (alert.context || sig.reason || '—'),
+    '<b>ENTRY</b>',
+    'Zone:    ' + zoneRange,
+    'Price:   $' + entryPrice + (distFromEntry ? '  (' + distFromEntry + '% from zone)' : ''),
     '',
-    '📊 <b>Trade levels:</b>',
-    '• Entry zone: $' + sig.entry,
-    '• Stop loss:  $' + sig.stop_loss,
-    '• Target 1:   $' + sig.take_profit_1,
-    '• Target 2:   $' + sig.take_profit_2,
-    '• Risk/Reward: 1:' + sig.rr,
-    '• Expires:    ' + expiry,
+    '<b>RISK MANAGEMENT</b>',
+    'Stop:    $' + sl + '  (risk ' + RISK_PCT + '% of account)',
+    'TP1:     $' + tp1 + '  (1:' + rr1 + 'R)',
+    'TP2:     $' + tp2,
     '',
-    '📈 <b>Score breakdown (' + sig.confidence + '/100):</b>',
-    ...bdLines,
+    '<b>CONFIDENCE: ' + conf + '/100 — ' + grade + '</b>',
+    'Session: ' + sess,
     '',
-    '🧭 <b>Market bias:</b> ' + (biasMap[sig.directional_bias] || 'Neutral'),
-    '📍 <b>Session:</b> ' + (sig.session || '—'),
+    '<b>WHY</b>',
+    ...reasons,
+    atrBlock,
     '',
-    '💡 <b>What this means:</b>',
-    (alert.interpretation || '—'),
+    '<b>VALID:  </b>' + validity,
+    '<b>CANCEL: </b>' + invalidation,
     '',
-    '⚡ <b>Action:</b>',
-    (alert.execution || 'Wait for pullback into entry zone before executing.'),
-    '',
-    '─────────────────',
-    gradeEmoji + ' ' + grade + ' Signal #' + (sig.id || '—') + ' | Aurum Signals'
+    '─────────────────────────────',
+    'Aurum Signals · #' + (sig.id || '—')
   ].join('\n');
 }
+
 
 // Format pre-signal alert for Telegram
+// Format pre-signal alert for Telegram — short, readable in <5 seconds
 function formatTelegramPreSignal(sym, ns) {
-  const asset  = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
-  const isBuy  = ns.direction === 'BUY';
-  const emojis = {
-    approaching_liquidity:  '📍',
-    sweep_detected:         '⚡',
-    displacement_confirmed: '↗️',
-    structure_break:        '✅'
-  };
-  const emoji = emojis[ns.stage] || '📡';
-  const stageLabel = {
-    approaching_liquidity:  'KEY LEVEL NEARBY',
-    sweep_detected:         'LIQUIDITY GRAB DETECTED',
-    displacement_confirmed: 'STRONG MOVE CONFIRMED',
-    structure_break:        'TREND SHIFT CONFIRMED'
-  }[ns.stage] || 'SETUP FORMING';
+  const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const dir   = ns.direction || '—';
 
-  const alert = ns.alert || {};
-  return [
-    emoji + ' <b>' + asset + ' — ' + stageLabel + '</b>',
-    '',
-    alert.context || ns.message || '—',
-    '',
-    '⏳ ' + (alert.action || 'Monitoring. No action required yet.'),
-    '',
-    '─────────────────',
-    'Pre-signal | Aurum Signals'
-  ].join('\n');
+  const stageConfig = {
+    approaching_liquidity:  { emoji: '📍', line: 'Approaching key zone — watch for sweep' },
+    sweep_detected:         { emoji: '⚡', line: 'Liquidity grab detected — waiting for displacement' },
+    displacement_confirmed: { emoji: '↗️', line: 'Strong move confirmed — waiting for trend shift' },
+    structure_break:        { emoji: '✅', line: 'Trend shift confirmed — waiting for pullback entry' },
+    waiting_pullback:       { emoji: '🎯', line: 'Pullback zone reached — entry evaluating' },
+  };
+
+  const cfg     = stageConfig[ns.stage] || { emoji: '📡', line: ns.message || 'Setup forming' };
+  const zoneConf = ns.zone_confidence;
+  const confStr  = zoneConf ? '  Zone: ' + zoneConf.total + '/100' : '';
+
+  return cfg.emoji + ' <b>' + asset + ' ' + dir + '</b> — ' + cfg.line + confStr + '\n─────────────────\nAurum Signals';
 }
+
 
 // ═══════════════════════════════════════════════════════════════
 // AUTO-SCAN ENGINE
@@ -1373,34 +2580,747 @@ function formatTelegramPreSignal(sym, ns) {
 // Sends Telegram alerts when signals or pre-signals are detected.
 // Tracks sent signals to avoid duplicate alerts.
 // ═══════════════════════════════════════════════════════════════
-const sentSignals    = new Set(); // track signal IDs already alerted
-const sentPreSignals = {};        // track pre-signal stages already alerted per symbol
+// ═══════════════════════════════════════════════════════════════════════════
+// SETUP STATE MACHINE
+// One state object per symbol. All alerts are event-driven (fire on transition).
+// No alert fires twice for the same event in the same setup lifecycle.
+// ═══════════════════════════════════════════════════════════════════════════
 
-// Active setup tracker — max 1 per symbol at a time
-// { XAUUSD: { direction, entry, startedAt, stage }, XAGUSD: {...} }
-const activeSetups = {};
+const SETUP_STAGES = ['idle','approaching','sweep','move','trend','pullback','entry'];
+
+function createSetup(sym, direction, levelOrZone) {
+  const id  = sym + '_' + Date.now();
+  const zoneId = levelOrZone && levelOrZone.isZone
+    ? Math.round(levelOrZone.minPrice) + '-' + Math.round(levelOrZone.maxPrice)
+    : levelOrZone ? Math.round(parseFloat(levelOrZone.price || 0)) : 'none';
+  const setup = {
+    id,
+    sym,
+    direction,
+    zoneId,
+    level: levelOrZone,
+    stage: 'idle',
+    active: true,
+    invalidated: false,
+    // Event fired flags — each fires exactly ONCE per setup lifecycle
+    events: {
+      approaching:  false,
+      sweep:        false,
+      move:         false,
+      trend:        false,
+      pullback:     false,
+      entry:        false,
+      invalidated:  false,
+    },
+    // Alert state — tracks what Telegram messages have been sent for this setup
+    tgAlerts: {
+      preEntry: false,  // ⚠️ SETUP FORMING alert (sent at trend+valid pullback stage)
+      entry:    false,  // 🟢/🔴 full signal
+      invalid:  false,  // ⚠️ invalidation (only if preEntry or pullback reached)
+    },
+    // Candle index at which each stage was confirmed — enforces stage separation
+    stageCandleIdx: {
+      sweep:    -1,
+      move:     -1,
+      trend:    -1,
+      pullback: -1,
+      entry:    -1,
+    },
+    startedAt:       Date.now(),
+    lastEventAt:     Date.now(),
+    earlyLockUntil:  0,
+    cooldowns: {}
+  };
+  console.log('[setup] Created id=' + id + ' dir=' + direction + ' zone=' + zoneId);
+  return setup;
+}
+
+// Wrapper called from autoScan — creates setup AND logs it
+function createAndLogSetup(sym, direction, levelOrZone) {
+  const setup = createSetup(sym, direction, levelOrZone);
+  logSetupCreated(setup, levelOrZone);
+  return setup;
+}
+
+// Setups keyed by symbol
+const setups = { XAUUSD: null, XAGUSD: null };
+
+// Active trade monitor — tracks open positions after entry signal fires
+// { XAUUSD: { setupId, direction, entry, sl, tp1, tp2, high, low, resultLogged }, ... }
+const tradeMonitor = { XAUUSD: null, XAGUSD: null };
+
+// Per-symbol timing state — persists through setup resets
+// Tracks cooldowns for zone detection, bias flips, invalidation windows
+const symTiming = {
+  XAUUSD: {
+    zoneDetectionAllowedAt:  0,
+    biasFlipAllowedAt:       0,
+    lastInvalidatedAt:       0,
+    lastInvalidatedDir:      null,
+    pullbackStartCandleIdx:  -1,
+    pullbackCandleCount:     0,
+    lastSweepAlertAt:        0,
+    lastSweepDir:            null,
+    lastSweepZoneKey:        null,
+    // Structural bias — persists until opposite structure confirmed
+    structuralBiasDir:       null,
+    structuralBiasStage:     null,
+    structuralBiasAt:        0,
+    consecutiveFailures:     { BUY: 0, SELL: 0 },
+    // HTF (M15) structural bias — updated every scan
+    htfBias:                 'NEUTRAL',  // 'BULLISH' | 'BEARISH' | 'NEUTRAL'
+    htfLastBOS:              'NONE',     // 'UP' | 'DOWN' | 'NONE'
+    htfLastHigh:             0,
+    htfLastLow:              0,
+    htfUpdatedAt:            0,
+  },
+  XAGUSD: {
+    zoneDetectionAllowedAt:  0,
+    biasFlipAllowedAt:       0,
+    lastInvalidatedAt:       0,
+    lastInvalidatedDir:      null,
+    pullbackStartCandleIdx:  -1,
+    pullbackCandleCount:     0,
+    lastSweepAlertAt:        0,
+    lastSweepDir:            null,
+    lastSweepZoneKey:        null,
+    structuralBiasDir:       null,
+    structuralBiasStage:     null,
+    structuralBiasAt:        0,
+    consecutiveFailures:     { BUY: 0, SELL: 0 },
+    htfBias:                 'NEUTRAL',
+    htfLastBOS:              'NONE',
+    htfLastHigh:             0,
+    htfLastLow:              0,
+    htfUpdatedAt:            0,
+  }
+};
+
+const CANDLE_MS = 5 * 60 * 1000; // 5 minutes per M5 candle
+
+// Legacy compat — sentSignals dedup by entry price
+const sentSignals = new Set();
+
+// Transition: advance stage and fire alert if event not yet sent
+// Returns true if alert was sent, false if blocked
+async function fireEvent(setup, event, sym, alertFn, candleIdx = -1) {
+  if (!setup || !setup.active) {
+    console.log('[' + sym + '] fireEvent ' + event + ' blocked — setup inactive');
+    return false;
+  }
+  if (setup.invalidated) {
+    console.log('[' + sym + '] fireEvent ' + event + ' blocked — setup invalidated');
+    return false;
+  }
+  if (setup.events[event]) {
+    console.log('[' + sym + '] fireEvent ' + event + ' blocked — already fired for this setup (id=' + setup.id + ')');
+    return false;
+  }
+  // ── Candle separation: each stage must confirm on a strictly later candle
+  const stageOrder = ['sweep','move','trend','pullback','entry'];
+  const prevStageIdx = stageOrder.indexOf(event) - 1;
+  if (candleIdx >= 0 && prevStageIdx >= 0 && setup.stageCandleIdx) {
+    const prevStage = stageOrder[prevStageIdx];
+    const prevCandle = setup.stageCandleIdx[prevStage] ?? -1;
+    if (prevCandle >= 0 && candleIdx <= prevCandle) {
+      console.log('[' + sym + '] fireEvent ' + event + ' BLOCKED — same candle as ' +
+        prevStage + ' (idx=' + candleIdx + '). Must wait for next candle.');
+      return false;
+    }
+  }
+
+  // 15-minute cooldown per event type as safety net
+  const COOLDOWN_MS = 15 * 60 * 1000;
+  const lastFired = setup.cooldowns[event] || 0;
+  if (Date.now() - lastFired < COOLDOWN_MS) {
+    console.log('[' + sym + '] fireEvent ' + event + ' blocked — cooldown (' +
+      Math.round((COOLDOWN_MS - (Date.now() - lastFired)) / 60000) + 'min remaining)');
+    return false;
+  }
+
+  // Fire the event — update state atomically before sending
+  setup.events[event]  = true;
+  setup.stage          = event;
+  setup.lastEventAt    = Date.now();
+  setup.cooldowns[event] = Date.now();
+  // Record which candle confirmed this stage (for separation enforcement)
+  if (setup.stageCandleIdx && candleIdx >= 0) {
+    setup.stageCandleIdx[event] = candleIdx;
+  }
+  // Stage progression log (visible in Railway logs)
+  const stageLabels = {
+    approaching: 'Stage → approaching liquidity',
+    sweep:       'Stage → liquidity grab',
+    move:        'Stage → strong move confirmed',
+    trend:       'Stage → trend shift confirmed',
+    pullback:    'Stage → pullback valid',
+    entry:       '🟢 ENTRY READY — full signal generating'
+  };
+  console.log('[' + sym + '] ' + (stageLabels[event] || 'Stage → ' + event) + ' (id=' + setup.id + ')');
+
+  try { await alertFn(); } catch(e) { console.error('[' + sym + '] alert error:', e.message); }
+  return true;
+}
+
+// Invalidate a setup — fires exactly once
+async function invalidateSetup(sym, reason) {
+  const setup = setups[sym];
+  if (!setup) return;
+  if (setup.invalidated) {
+    console.log('[' + sym + '] Duplicate invalidation blocked (id=' + setup.id + ')');
+    return;
+  }
+  if (setup.events.invalidated) {
+    console.log('[' + sym + '] Invalidation alert already sent — blocking duplicate');
+    return;
+  }
+  setup.invalidated        = true;
+  setup.active             = false;
+  setup.events.invalidated = true;
+  setup.stage              = 'invalidated';
+  console.log('[' + sym + '] Setup invalidated → alert sent once (id=' + setup.id + '): ' + reason);
+  logInvalidation(setup, reason);
+  // In EXECUTION mode: only send invalidation if pre-entry alert was sent or pullback reached
+  const _shouldSendInvalidation = TELEGRAM_MODE === 'FULL' ||
+    setup.tgAlerts?.preEntry ||
+    setup.events?.pullback;
+  if (!_shouldSendInvalidation) {
+    console.log('[tg] Invalidation suppressed — pre-entry alert not yet sent (silent invalidation)');
+    return;
+  }
+
+  // ── BIAS FLIP ON INVALIDATION ─────────────────────────────────
+  // Invalidation = market rejected this direction → flip bias to opposite
+  const oppositeDir   = setup.direction === 'BUY' ? 'SELL' : 'BUY';
+  const t             = symTiming[sym];
+  let   biasMsg       = 'Watching for next opportunity.';
+  if (t) {
+    // Track consecutive failures per direction
+    t.consecutiveFailures[setup.direction] = (t.consecutiveFailures[setup.direction] || 0) + 1;
+    t.consecutiveFailures[oppositeDir]     = 0; // reset opposite count
+    const failures = t.consecutiveFailures[setup.direction];
+
+    // Flip structural bias to opposite direction
+    // Stage strength depends on how far the failed setup progressed
+    const failedStage = setup.stage === 'trend'    ? 'move'
+                      : setup.stage === 'pullback' ? 'trend'
+                      : setup.stage === 'move'     ? 'sweep'
+                      : 'sweep';
+    t.structuralBiasDir   = oppositeDir;
+    t.structuralBiasStage = failedStage;
+    t.structuralBiasAt    = Date.now();
+
+    const confStr = failures >= 3 ? ' (HIGH confidence — ' + failures + ' consecutive failures)'
+                  : failures >= 2 ? ' (' + failures + ' consecutive failures)'
+                  : '';
+    biasMsg = setup.direction + ' setup invalidated — short-term ' + oppositeDir +
+      ' bias active' + confStr + '.';
+    console.log('[bias] ' + sym + ': bias flipped → ' + oppositeDir +
+      ' after ' + setup.direction + ' invalidation (stage: ' + failedStage + ', failures: ' + failures + ')');
+  }
+
+  const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+  const dirEmoji = oppositeDir === 'BUY' ? '🟢' : '🔴';
+  await sendTelegram('⚠️ <b>' + asset + ' — SETUP INVALIDATED</b>\n\n' +
+    reason + '\n\n' + dirEmoji + ' ' + biasMsg +
+    '\n\n─────────────────\nAurum Signals');
+}
+
+// Reset a symbol's setup — called when session closes or new sweep on different zone
+function resetSetup(sym, reason) {
+  const existing = setups[sym];
+  if (existing) {
+    console.log('[' + sym + '] Setup reset (id=' + existing.id + '): ' + reason);
+    // Record cooldowns on invalidation — 2 candles (10 min) before new zone detection
+    const now = Date.now();
+    if (symTiming[sym]) {
+      symTiming[sym].lastInvalidatedAt      = now;
+      symTiming[sym].lastInvalidatedDir     = existing.direction;
+      symTiming[sym].zoneDetectionAllowedAt = now + 2 * CANDLE_MS;
+      symTiming[sym].biasFlipAllowedAt      = now + 2 * CANDLE_MS;
+      symTiming[sym].pullbackStartCandleIdx = -1;
+      symTiming[sym].pullbackCandleCount    = 0;
+      // Structural bias was updated in invalidateSetup (flipped to opposite direction)
+      // resetSetup just records the cooldown — bias is already correct
+      console.log('[timing] ' + sym + ': cooldown set — zone detection blocked for 10min after ' + reason);
+      console.log('[bias] ' + sym + ': bias now → ' +
+        (symTiming[sym].structuralBiasDir || 'none') +
+        ' (' + (symTiming[sym].structuralBiasStage || '?') + ' stage)');
+    }
+  }
+  setups[sym] = null;
+}
 
 // Session time remaining in minutes
 function sessionMinutesRemaining() {
   const h = new Date().getUTCHours();
   const m = new Date().getUTCMinutes();
   const nowMins = h * 60 + m;
-  // London ends 16:00, NY ends 22:00
-  const londonEnd = 16 * 60;
-  const nyEnd     = 22 * 60;
-  if (nowMins >= 7*60  && nowMins < londonEnd) return londonEnd - nowMins;
-  if (nowMins >= 13*60 && nowMins < nyEnd)      return nyEnd - nowMins;
+  if (nowMins >= 7*60  && nowMins < 16*60) return 16*60 - nowMins;
+  if (nowMins >= 13*60 && nowMins < 22*60) return 22*60 - nowMins;
   return 0;
 }
 
-// Invalidation sender
-async function sendInvalidation(sym, reason) {
-  const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
-  const msg = '⚠️ <b>' + asset + ' — SETUP INVALIDATED</b>\n\n' +
-    reason + '\n\nThe setup has been cancelled. Watching for next opportunity.\n\n' +
-    '─────────────────\nAurum Signals';
-  console.log('[invalidation] ' + sym + ': ' + reason);
-  await sendTelegram(msg);
+// ═══════════════════════════════════════════════════════════════════════════
+// AGGRESSIVE ENTRY ENGINE
+// Evaluates ONLY the primary zone. One setup per asset.
+// Confirmation: sweep → rejection → momentum (3 conditions, fast)
+// ═══════════════════════════════════════════════════════════════════════════
+
+function aggressiveEntryEngine(sym, m5, primaryZone, sess) {
+  if (!primaryZone || !m5 || m5.length < 10) {
+    return { type: 'NO_SETUP', reason: 'No primary zone or insufficient data' };
+  }
+
+  const direction  = primaryZone.direction; // already set by selectPrimaryZone
+  const zoneLow    = primaryZone.minPrice;
+  const zoneHigh   = primaryZone.maxPrice;
+  const zoneRef    = direction === 'BUY' ? zoneLow : zoneHigh;
+  const CLOSE_TOL  = 0.001;  // 0.1% tolerance for close condition
+  const SWEEP_MIN  = 0.0005; // 0.05% minimum sweep depth — anti-fake-sweep filter
+
+  // Rolling average candle size (last 20)
+  const recent20 = m5.slice(-20);
+  const avgSize  = recent20.reduce((s, c) => s + range(c), 0) / recent20.length;
+  if (avgSize === 0) return { type: 'NO_SETUP', reason: 'Zero average candle size' };
+
+  // Scan recent candles for a valid sweep candle (last 6)
+  for (let i = m5.length - 6; i < m5.length; i++) {
+    if (i < 1) continue;
+    const c = m5[i];
+    const r = range(c);
+    if (r === 0) continue;
+
+    // ── INVALIDATION: candle too small ───────────────────────────
+    if (r < avgSize * 0.7) continue; // skip tiny candles
+    const wickFraction = direction === 'BUY'
+      ? (Math.min(c.o, c.c) - c.l) / r
+      : (c.h - Math.max(c.o, c.c)) / r;
+    if (wickFraction < 0.15) continue; // wick < 15% = no rejection
+
+    // ── CONDITION 1: LIQUIDITY SWEEP ─────────────────────────────
+    let sweptBeyond = false;
+    if (direction === 'BUY') {
+      // Price must trade BELOW zone low (wick OR body)
+      sweptBeyond = c.l < zoneLow * (1 - SWEEP_MIN);
+    } else {
+      // Price must trade ABOVE zone high (wick OR body)
+      sweptBeyond = c.h > zoneHigh * (1 + SWEEP_MIN);
+    }
+    if (!sweptBeyond) continue;
+
+    // ── INVALIDATION: barely touches zone ────────────────────────
+    const sweepDepth = direction === 'BUY'
+      ? (zoneLow - c.l) / zoneLow
+      : (c.h - zoneHigh) / zoneHigh;
+    if (sweepDepth < SWEEP_MIN) continue;
+
+    // ── CONDITION 2: CLOSE CONDITION ─────────────────────────────
+    let validClose = false;
+    if (direction === 'BUY') {
+      // Close inside zone OR within 0.1% below zone low
+      validClose = c.c >= zoneLow * (1 - CLOSE_TOL);
+    } else {
+      // Close inside zone OR within 0.1% above zone high
+      validClose = c.c <= zoneHigh * (1 + CLOSE_TOL);
+    }
+    if (!validClose) continue;
+
+    // ── CONDITION 3: REJECTION WICK ──────────────────────────────
+    const wickPct = direction === 'BUY'
+      ? (Math.min(c.o, c.c) - c.l) / r
+      : (c.h - Math.max(c.o, c.c)) / r;
+    if (wickPct < 0.25) continue; // wick must be ≥ 25% of range
+
+    // ── MICRO-STRUCTURE: no immediate lower-low / higher-high ────
+    if (i + 1 < m5.length) {
+      const next = m5[i + 1];
+      if (direction === 'BUY'  && next.l < c.l) continue; // lower low = cancel
+      if (direction === 'SELL' && next.h > c.h) continue; // higher high = cancel
+    }
+
+    // ── CONDITION 4: EARLY MOMENTUM (within next 2 candles) ──────
+    let momentumCandle = null;
+    let momentumDelay  = 0;
+    for (let j = i + 1; j <= Math.min(i + 2, m5.length - 1); j++) {
+      const mc2  = m5[j];
+      const bull = mc2.c > mc2.o;
+      const bear = mc2.c < mc2.o;
+      const big  = range(mc2) >= avgSize * 1.2;
+      // Condition A: single large candle in direction
+      if (direction === 'BUY'  && bull && big) { momentumCandle = mc2; momentumDelay = j - i; break; }
+      if (direction === 'SELL' && bear && big) { momentumCandle = mc2; momentumDelay = j - i; break; }
+      // Condition B: 2 consecutive candles in direction
+      if (j > i + 1) {
+        const prev2 = m5[j - 1];
+        if (direction === 'BUY'  && bull && prev2.c > prev2.o) { momentumCandle = mc2; momentumDelay = j - i; break; }
+        if (direction === 'SELL' && bear && prev2.c < prev2.o) { momentumCandle = mc2; momentumDelay = j - i; break; }
+      }
+    }
+
+    // ── TIME FILTER: momentum must occur within 2 candles ────────
+    if (!momentumCandle) {
+      const candlesSinceSweep = m5.length - 1 - i;
+
+      // ── EARLY ENTRY CONDITION ─────────────────────────────────
+      // If sweep candle itself is strong enough, skip momentum wait.
+      // All three sub-conditions must pass — weak sweeps never qualify.
+      const earlyWickOk  = wickPct >= 0.35;                   // wick ≥ 35% of range
+      const earlySizeOk  = r >= avgSize * 1.2;                // candle ≥ 1.2x average
+      // Strong close back inside zone (not just touching edge)
+      const earlyCloseOk = direction === 'BUY'
+        ? c.c >= zoneLow + (zoneHigh - zoneLow) * 0.25        // closed at least 25% into zone
+        : c.c <= zoneHigh - (zoneHigh - zoneLow) * 0.25;
+
+      if (earlyWickOk && earlySizeOk && earlyCloseOk) {
+        // Strong sweep candle — trigger early entry immediately
+        let earlyConf = primaryZone.confidence?.total || 50;
+        earlyConf += sweepDepth >= 0.003 ? 10 : 5;  // sweep depth bonus
+        // No momentum bonus — penalise slightly for no follow-through yet
+        earlyConf -= 5;
+        earlyConf = Math.min(Math.max(Math.round(earlyConf), 0), 100);
+
+        console.log('[entry] ' + sym + ' ' + direction + ' AGGRESSIVE_EARLY — wick=' +
+          (wickPct*100).toFixed(1) + '% size=' + (r/avgSize).toFixed(2) + 'x confidence=' + earlyConf);
+
+        return {
+          type:         'ENTRY_READY',
+          direction,
+          mode:         'AGGRESSIVE_EARLY',
+          zone:         { low: zoneLow, high: zoneHigh },
+          sweepCandle:  i,
+          sweepDepth:   parseFloat((sweepDepth * 100).toFixed(3)),
+          wickPct:      parseFloat((wickPct * 100).toFixed(1)),
+          momentumDelay: 0,
+          dispRatio:    parseFloat((r / avgSize).toFixed(2)),
+          entry_reason: [
+            'Liquidity sweep confirmed (depth ' + (sweepDepth*100).toFixed(3) + '%)',
+            'Strong rejection: ' + (wickPct*100).toFixed(1) + '% wick (≥35% required)',
+            'Candle size: ' + (r/avgSize).toFixed(2) + 'x average (≥1.2x required)',
+            'Strong close back inside zone — early entry triggered'
+          ],
+          confidence:   earlyConf,
+          primaryZone
+        };
+      }
+
+      // Weak sweep — wait for momentum (max 2 candles)
+      if (candlesSinceSweep <= 2) {
+        return {
+          type:        'SWEEP_FORMING',
+          direction,
+          sweepCandle: i,
+          wickPct:     parseFloat((wickPct * 100).toFixed(1)),
+          reason:      'Sweep confirmed — awaiting momentum (' + (2 - candlesSinceSweep) + ' candles remaining)' +
+                       ' | Early entry blocked: ' +
+                       (!earlyWickOk  ? 'wick ' + (wickPct*100).toFixed(1) + '% < 35%' :
+                        !earlySizeOk  ? 'candle ' + (r/avgSize).toFixed(2) + 'x < 1.2x avg' :
+                        !earlyCloseOk ? 'close not deep enough inside zone' : '?')
+        };
+      }
+      // Momentum window expired — return NO_ENTRY with specific reason
+      return {
+        type:      'NO_ENTRY',
+        direction,
+        sweepCandle: i,
+        reason:    '❌ No momentum after sweep — window expired (2 candles elapsed)'
+      };
+    }
+
+    // ── ALL 3 CONDITIONS MET → ENTRY CONFIRMED ───────────────────
+
+    // Confidence score adjustment
+    let confidence = primaryZone.confidence?.total || 50;
+
+    // Sweep depth bonus
+    if (sweepDepth >= 0.003)     confidence += 10; // deep sweep
+    else if (sweepDepth >= 0.001) confidence += 5;
+
+    // Momentum speed bonus/penalty
+    if (momentumDelay === 1)     confidence += 10; // confirmed in 1 candle
+    else                          confidence -= 10; // took 2 candles
+
+    // Displacement bonus
+    const dispRatio = range(momentumCandle) / avgSize;
+    if (dispRatio >= 1.5)        confidence += 5;
+
+    // Wick quality penalty
+    if (wickPct < 0.20)          confidence -= 15;
+
+    confidence = Math.min(Math.max(Math.round(confidence), 0), 100);
+
+    const entryReasons = [
+      'Liquidity sweep: ' + direction === 'BUY'
+        ? 'price swept below $' + zoneLow.toFixed(3) + ' (depth ' + (sweepDepth*100).toFixed(3) + '%)'
+        : 'price swept above $' + zoneHigh.toFixed(3) + ' (depth ' + (sweepDepth*100).toFixed(3) + '%)',
+      'Rejection: ' + (wickPct * 100).toFixed(1) + '% wick confirmed',
+      'Momentum: ' + (momentumDelay === 1 ? 'confirmed in 1 candle (' + dispRatio.toFixed(2) + 'x avg)' : '2 consecutive candles')
+    ];
+
+    console.log('[entry] ' + sym + ' ' + direction + ' ENTRY_READY — confidence=' + confidence +
+      ' sweep=' + (sweepDepth*100).toFixed(3) + '% wick=' + (wickPct*100).toFixed(1) + '% delay=' + momentumDelay);
+
+    return {
+      type:         'ENTRY_READY',
+      direction,
+      mode:         'AGGRESSIVE',
+      zone:         { low: zoneLow, high: zoneHigh },
+      sweepCandle:  i,
+      sweepDepth:   parseFloat((sweepDepth * 100).toFixed(3)),
+      wickPct:      parseFloat((wickPct * 100).toFixed(1)),
+      momentumDelay,
+      dispRatio:    parseFloat(dispRatio.toFixed(2)),
+      entry_reason: entryReasons,
+      confidence,
+      primaryZone
+    };
+  }
+
+  return { type: 'NO_ENTRY', direction, reason: 'No valid sweep/rejection/momentum pattern found' };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SIGNAL VALIDATION ENGINE
+// Runs before any setup is created or any alert is sent.
+// All 8 rules are hard blocks — not filters, not suggestions.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MIN_ZONE_WIDTH_PCT = 0.0002;  // 0.02% minimum zone width (≈$0.90 on gold)
+const MAX_CANDLE_AGE_MINS = 15;     // stale data threshold
+
+function validateSignal(sym, sweep, m5, levels, existingSetup) {
+  const reasons = [];
+
+  // ── RULE 1: DIRECTION CONSISTENCY ─────────────────────────────
+  // Equal Highs (EQH) = stop cluster ABOVE price = sweep up → SELL reversal
+  // Equal Lows  (EQL) = stop cluster BELOW price = sweep down → BUY reversal
+  // PDH/ASH = resistance above → sweep up → SELL
+  // PDL/ASL = support below → sweep down → BUY
+  if (sweep && sweep.found && sweep.level) {
+    const lvlType = sweep.level.type;
+    const expectedDir = getZoneDirection(sweep.level);
+    if (expectedDir && sweep.direction !== expectedDir) {
+      reasons.push('Direction mismatch: ' + lvlType + ' zone requires ' + expectedDir +
+        ' but got ' + sweep.direction);
+    }
+  }
+
+  // ── RULE 2: ZONE VALIDITY ──────────────────────────────────────
+  if (sweep && sweep.level && sweep.level.isZone) {
+    const z = sweep.level;
+    const refPrice = z.minPrice || z.price || 1;
+    // min === max means single price point, not a real zone
+    if (!z.minPrice || !z.maxPrice || z.minPrice === z.maxPrice) {
+      reasons.push('Zone invalid: min === max (single price point, not a zone)');
+    } else {
+      const width = (z.maxPrice - z.minPrice) / refPrice;
+      if (width < MIN_ZONE_WIDTH_PCT) {
+        reasons.push('Zone too narrow: ' + (width*100).toFixed(4) + '% width (min ' + (MIN_ZONE_WIDTH_PCT*100) + '%)');
+      }
+    }
+    // Must have at least 2 distinct touch levels
+    if ((z.totalTouches || 0) < 2) {
+      reasons.push('Insufficient touches: ' + (z.totalTouches || 0) + ' (min 2)');
+    }
+  }
+
+  // ── RULE 3: MINIMUM TOUCH QUALITY ─────────────────────────────
+  if (sweep && sweep.level) {
+    const touches = sweep.level.totalTouches || sweep.level.strengthScore || 1;
+    if (touches < 2) {
+      reasons.push('Touch quality too low: only ' + touches + ' touch(es)');
+    }
+  }
+
+  // ── RULE 4: DUPLICATE SETUP ───────────────────────────────────
+  if (existingSetup && existingSetup.active && !existingSetup.invalidated) {
+    // If same zone and same direction → duplicate
+    if (existingSetup.direction === sweep?.direction) {
+      const newZoneId  = sweep?.level?.isZone
+        ? Math.round(sweep.level.minPrice) + '-' + Math.round(sweep.level.maxPrice)
+        : Math.round(parseFloat(sweep?.level?.price || 0));
+      if (String(existingSetup.zoneId) === String(newZoneId)) {
+        reasons.push('Duplicate: setup already active for same zone ' + existingSetup.zoneId);
+      }
+    }
+  }
+
+  // ── RULE 5: ZONE ALREADY SWEPT RECENTLY ───────────────────────
+  // If this same zone was swept in the last 2 scans (10 min) and price hasn't moved away
+  // → block to prevent re-triggering on the same sweep candle
+  // (handled by the state machine's event lock — belt+braces here)
+  if (existingSetup && existingSetup.events?.sweep && existingSetup.active) {
+    reasons.push('Zone already swept in current setup — state machine handles progression');
+  }
+
+  // ── RULE 6: DATA FRESHNESS ─────────────────────────────────────
+  if (m5 && m5.length > 0) {
+    const lastCandleAge = (Date.now() - m5[m5.length - 1].t) / 60000; // minutes
+    if (lastCandleAge > MAX_CANDLE_AGE_MINS) {
+      reasons.push('Stale data: last candle ' + Math.round(lastCandleAge) + ' minutes old (max ' + MAX_CANDLE_AGE_MINS + ')');
+    }
+  }
+
+  // ── RULE 7: STRUCTURE SEQUENCE INTEGRITY ──────────────────────
+  // sweep must be detected before displacement, BOS, pullback
+  // (the state machine enforces this in order — this catches edge cases
+  //  where data arrives out of order or functions are called in wrong context)
+  if (!sweep || !sweep.found) {
+    // Without a sweep there is no valid setup origin
+    if (existingSetup && !existingSetup.events?.sweep) {
+      reasons.push('Sequence violation: no liquidity grab detected (cannot progress)');
+    }
+  }
+
+  // ── RULE 8: VOLATILITY / SWEEP STRENGTH ───────────────────────
+  if (sweep && sweep.found) {
+    const wickPct = sweep.wickPct || 0;
+    if (wickPct < 0.25) {
+      reasons.push('Sweep too weak: wick ' + Math.round(wickPct * 100) + '% of range (min 25%)');
+    }
+    if (m5 && m5.length >= 10) {
+      const avg10 = m5.slice(-10).reduce((s,c) => s + range(c), 0) / 10;
+      const sweepCandle = m5[sweep.candleIdx];
+      if (sweepCandle && avg10 > 0 && range(sweepCandle) < avg10 * 0.3) {
+        reasons.push('Sweep candle too small: ' + (range(sweepCandle)/avg10*100).toFixed(0) + '% of avg range (min 30%)');
+      }
+    }
+  }
+
+  const valid = reasons.length === 0;
+  if (!valid) {
+    reasons.forEach(r => console.log('[validate] ' + sym + ' REJECTED: ' + r));
+  }
+  return { valid, reasons };
+}
+
+// Fix sweep direction to always match zone type
+// Called after detectSweep — overrides geometry-based direction with zone-type direction
+function correctSweepDirection(sweep) {
+  if (!sweep || !sweep.found || !sweep.level) return sweep;
+  const correct = getZoneDirection(sweep.level) || sweep.direction;
+  if (correct !== sweep.direction) {
+    console.log('[bias] Direction corrected: ' + sweep.direction + ' → ' + correct +
+      ' (zone type: ' + sweep.level.type + ')');
+  }
+  return { ...sweep, direction: correct };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HTF STRUCTURAL BIAS ENGINE
+// Uses M15 candles to determine higher-timeframe directional bias.
+// Bias is a CONFIDENCE MODIFIER — never a trade filter.
+// Returns: { bias, lastBOS, lastHigh, lastLow, reason }
+// ═══════════════════════════════════════════════════════════════════════════
+function calcHTFBias(m15Candles) {
+  if (!m15Candles || m15Candles.length < 8) {
+    return { bias: 'NEUTRAL', lastBOS: 'NONE', lastHigh: 0, lastLow: 0, reason: 'Insufficient M15 data' };
+  }
+
+  // Use last 20 M15 candles (~5 hours) for structure analysis
+  const candles = m15Candles.slice(-20);
+  const n = candles.length;
+
+  // ── 1. Find swing highs and swing lows (pivot method: higher on both sides)
+  const swingHighs = [];
+  const swingLows  = [];
+  for (let i = 1; i < n - 1; i++) {
+    if (candles[i].h > candles[i-1].h && candles[i].h > candles[i+1].h) {
+      swingHighs.push({ price: candles[i].h, idx: i });
+    }
+    if (candles[i].l < candles[i-1].l && candles[i].l < candles[i+1].l) {
+      swingLows.push({ price: candles[i].l, idx: i });
+    }
+  }
+
+  if (swingHighs.length < 2 || swingLows.length < 2) {
+    return { bias: 'NEUTRAL', lastBOS: 'NONE', lastHigh: candles[n-1].h, lastLow: candles[n-1].l,
+             reason: 'Insufficient swing structure' };
+  }
+
+  const lastHigh  = swingHighs[swingHighs.length - 1].price;
+  const prevHigh  = swingHighs[swingHighs.length - 2].price;
+  const lastLow   = swingLows[swingLows.length  - 1].price;
+  const prevLow   = swingLows[swingLows.length  - 2].price;
+  const livePrice = candles[n-1].c;
+
+  // ── 2. Detect BOS: last swing high broken = UP BOS, last swing low broken = DOWN BOS
+  const BOS_MARGIN = 0.0002; // 0.02% — minor buffer to avoid noise
+  let lastBOS = 'NONE';
+  // Check last few candles for breaks
+  const recent = candles.slice(-5);
+  for (const c of recent) {
+    if (c.c > lastHigh * (1 + BOS_MARGIN)) { lastBOS = 'UP';   break; }
+    if (c.c < lastLow  * (1 - BOS_MARGIN)) { lastBOS = 'DOWN'; break; }
+  }
+
+  // ── 3. HH/HL or LH/LL structure
+  const isHHHL = lastHigh > prevHigh && lastLow > prevLow;  // bullish structure
+  const isLHLL = lastHigh < prevHigh && lastLow < prevLow;  // bearish structure
+
+  // ── 4. Price vs structure midpoint
+  const structureMid = (lastHigh + lastLow) / 2;
+  const aboveMid = livePrice > structureMid;
+
+  // ── 5. Determine bias
+  let bias = 'NEUTRAL';
+  let reason = '';
+
+  if (lastBOS === 'UP' && (isHHHL || aboveMid)) {
+    bias = 'BULLISH';
+    reason = 'BOS UP + ' + (isHHHL ? 'HH/HL structure' : 'price above mid');
+  } else if (lastBOS === 'DOWN' && (isLHLL || !aboveMid)) {
+    bias = 'BEARISH';
+    reason = 'BOS DOWN + ' + (isLHLL ? 'LH/LL structure' : 'price below mid');
+  } else if (isHHHL && aboveMid) {
+    bias = 'BULLISH';
+    reason = 'HH/HL structure + price above mid (no BOS yet)';
+  } else if (isLHLL && !aboveMid) {
+    bias = 'BEARISH';
+    reason = 'LH/LL structure + price below mid (no BOS yet)';
+  } else {
+    bias = 'NEUTRAL';
+    reason = 'Choppy / ranging structure';
+  }
+
+  return { bias, lastBOS, lastHigh, lastLow, structureMid, reason };
+}
+
+// ── TRADE RESULT MONITOR ──────────────────────────────────────────────────────
+// Runs on every scan after an entry signal fires.
+// Checks live price against SL/TP1/TP2 and auto-logs the result.
+function checkTradeMonitor(sym, livePrice, m5) {
+  const mon = tradeMonitor[sym];
+  if (!mon || mon.resultLogged) return;
+
+  const isBuy  = mon.direction === 'BUY';
+  const high   = Math.max(...m5.slice(-3).map(c => c.h)); // recent 3-candle high
+  const low    = Math.min(...m5.slice(-3).map(c => c.l)); // recent 3-candle low
+
+  // Track adverse excursion for BE detection
+  mon.maxFav   = isBuy
+    ? Math.max(mon.maxFav || mon.entry, high)
+    : Math.min(mon.maxFav || mon.entry, low);
+
+  let result = null;
+
+  if (isBuy) {
+    if (mon.tp2 && high >= mon.tp2)       result = 'TP2';
+    else if (mon.tp1 && high >= mon.tp1)  result = 'TP1';
+    else if (low  <= mon.sl)              result = 'SL';
+  } else {
+    if (mon.tp2 && low  <= mon.tp2)       result = 'TP2';
+    else if (mon.tp1 && low  <= mon.tp1)  result = 'TP1';
+    else if (high >= mon.sl)              result = 'SL';
+  }
+
+  if (result) {
+    mon.resultLogged = true;
+    logTradeResult(mon.setupId, result);
+    console.log('[monitor] ' + sym + ': ' + result + ' hit — ' + mon.direction +
+      ' entry=' + mon.entry + ' sl=' + mon.sl + ' tp1=' + mon.tp1);
+    tradeMonitor[sym] = null; // clear monitor
+  }
 }
 
 async function autoScan() {
@@ -1408,36 +3328,44 @@ async function autoScan() {
   const inSession = (h >= 7 && h < 16) || (h >= 13 && h < 22);
 
   if (!inSession) {
-    // Clear active setups at session close
     for (const sym of ['XAUUSD','XAGUSD']) {
-      if (activeSetups[sym]) {
-        delete activeSetups[sym];
-        console.log('[auto-scan] Session closed — cleared active setup for ' + sym);
+      if (setups[sym]) {
+        resetSetup(sym, 'Session closed');
       }
+      // Clear any open trade monitor at session close
+      if (tradeMonitor[sym] && !tradeMonitor[sym].resultLogged) {
+        console.log('[monitor] ' + sym + ': session closed — trade monitor cleared (no result)');
+        tradeMonitor[sym] = null;
+      }
+      // Reset consecutive failures and structural bias at session close
+      if (symTiming[sym]) {
+        symTiming[sym].structuralBiasDir   = null;
+        symTiming[sym].structuralBiasStage = null;
+        symTiming[sym].consecutiveFailures = { BUY: 0, SELL: 0 };
+      }
+      clearZoneMemory(sym); // zone memory resets each session
     }
     console.log('[auto-scan] Outside session (UTC ' + h + ':xx) — skipping');
     return;
   }
 
-  // ── SESSION TIME REMAINING CHECK ──────────────────────────────
   const minsLeft = sessionMinutesRemaining();
   if (minsLeft < 60) {
-    console.log('[auto-scan] Less than 60 min remaining in session (' + minsLeft + 'min) — no new signals');
+    console.log('[auto-scan] <60min in session (' + minsLeft + 'min) — no new signals');
     return;
   }
 
-  console.log('[auto-scan] Running — UTC ' + h + ':' + String(new Date().getUTCMinutes()).padStart(2,'0') +
-    ' | Session: ' + minsLeft + 'min remaining');
+  console.log('[auto-scan] Scanning — UTC ' + h + ':' + String(new Date().getUTCMinutes()).padStart(2,'0') +
+    ' | ' + minsLeft + 'min remaining');
 
   const delay = ms => new Promise(r => setTimeout(r, ms));
 
-  for (const sym of ['XAUUSD', 'XAGUSD']) {
+  for (const sym of ['XAUUSD','XAGUSD']) {
     try {
       const m5 = await getCandles(sym, '5min', 120);
       if (!m5 || m5.length < 50) {
-        console.log('[auto-scan] ' + sym + ': insufficient data (' + (m5?.length||0) + ')');
-        await delay(400);
-        continue;
+        console.log('[auto-scan] ' + sym + ': insufficient data');
+        await delay(400); continue;
       }
 
       const m15        = deriveM15FromM5(m5);
@@ -1446,177 +3374,643 @@ async function autoScan() {
       const livePrice  = m5[m5.length-1].c;
       const volatility = checkATR(sym, atrValues);
       const levels     = buildLevels(m5, m15);
+
+      // Check open trade monitor first (non-blocking result detection)
+      checkTradeMonitor(sym, livePrice, m5);
+
+      // ── UPDATE HTF BIAS from M15 ──────────────────────────────
+      const htfResult = calcHTFBias(m15);
+      if (timing) {
+        timing.htfBias      = htfResult.bias;
+        timing.htfLastBOS   = htfResult.lastBOS;
+        timing.htfLastHigh  = htfResult.lastHigh;
+        timing.htfLastLow   = htfResult.lastLow;
+        timing.htfUpdatedAt = Date.now();
+      }
+      console.log('[htf] ' + sym + ': bias=' + htfResult.bias +
+        ' BOS=' + htfResult.lastBOS + ' — ' + htfResult.reason);
       const sess       = sessionName(Date.now());
       const sessionOk  = sess !== null;
       const sessionOverlap = sess === 'London+NY Overlap';
 
-      // Directional bias
-      const pdhLevel = levels.find(l => l.type === 'PDH');
-      const pdlLevel = levels.find(l => l.type === 'PDL');
-      let directionalBias = 'neutral', biasPenalty = 0;
-      if (pdhLevel && livePrice > pdhLevel.price)      { directionalBias = 'bearish_bias'; biasPenalty = 5; }
-      else if (pdlLevel && livePrice < pdlLevel.price) { directionalBias = 'bullish_bias'; biasPenalty = 5; }
+      // Unified directional bias — single source of truth
+      const globalBias    = calcGlobalBias(levels, livePrice, setups[sym]);
+      const directionalBias = globalBias.bias === 'BUY'  ? 'bullish_bias'
+                            : globalBias.bias === 'SELL' ? 'bearish_bias'
+                            : 'neutral';
+      // Penalty increases with stronger confirmed bias
+      const biasPenalty = Math.abs(globalBias.score) >= 3 ? 8
+                        : Math.abs(globalBias.score) >= 2 ? 5
+                        : Math.abs(globalBias.score) >= 1 ? 3 : 0;
 
-      // ── ACTIVE SETUP: check invalidation ─────────────────────
-      const active = activeSetups[sym];
-      if (active) {
-        const ageCandles = Math.round((Date.now() - active.startedAt) / (5 * 60 * 1000));
+      const asset = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+      let setup   = setups[sym];
 
-        // Time decay invalidation
-        if (ageCandles > 10) {
-          delete activeSetups[sym];
-          await sendInvalidation(sym, 'Setup expired — no entry within 10 candles (50 minutes).');
+      // ── INVALIDATION CHECKS on existing setup ──────────────────
+      if (setup && setup.active && !setup.invalidated) {
+        const ageMins = (Date.now() - setup.startedAt) / 60000;
+
+        // Time decay — 50 minutes max
+        if (ageMins > 50) {
+          await invalidateSetup(sym, 'Setup expired — no entry within 50 minutes.');
+          resetSetup(sym, 'Time decay');
           await delay(400); continue;
         }
 
-        // Structure break against direction
-        const sweep2 = detectSweep(m5, levels);
-        if (sweep2.found && sweep2.direction !== active.direction) {
-          delete activeSetups[sym];
-          await sendInvalidation(sym, 'Structure broke against trade direction. Setup cancelled.');
-          await delay(400); continue;
-        }
-
-        // Already have active setup — skip new signal generation for this symbol
-        console.log('[auto-scan] ' + sym + ': active setup (' + active.stage + ', ' + ageCandles + ' candles old) — holding');
-        await delay(400); continue;
-      }
-
-      // ── SIGNAL ENGINE ─────────────────────────────────────────
-      const sweep = detectSweep(m5, levels);
-      let signal = null, near_setup = null;
-
-      if (sessionOk && volatility.ok !== false && sweep.found) {
-        const sweepToNow = m5.length - 1 - sweep.candleIdx;
-
-        if (sweepToNow > 10) {
-          // Time decay — sweep too old
-          console.log('[auto-scan] ' + sym + ': sweep expired (' + sweepToNow + ' candles ago)');
-        } else {
-          const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction);
-
-          if (!disp.found) {
-            near_setup = { stage: 'sweep_detected', direction: sweep.direction,
-              message: sweep.level.label + ' sweep confirmed — awaiting strong move',
-              alert: { context: 'Liquidity grab detected at ' + sweep.level.label + '. Waiting for displacement candle.' }};
-          } else {
-            const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
-
-            if (!bos.found) {
-              near_setup = { stage: 'displacement_confirmed', direction: sweep.direction,
-                message: 'Displacement confirmed (' + disp.ratio + 'x body) — awaiting trend shift',
-                alert: { context: 'Strong move confirmed. Waiting for break of structure.' }};
-            } else {
-              const m15bos = m15.length >= 8 ? confirmBOS_M15(m15, sweep.direction, bos.bos_level) : false;
-              const pb     = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
-
-              if (!pb.found) {
-                if (pb.reason && pb.reason.includes('70%')) {
-                  // Pullback exceeded 70% — hard invalidation
-                  await sendInvalidation(sym, 'Pullback exceeded 70% retracement. Setup invalidated.');
-                } else {
-                  near_setup = { stage: 'structure_break', direction: sweep.direction,
-                    message: 'Trend shift confirmed — waiting for pullback entry zone',
-                    alert: { context: 'BOS confirmed on M5' + (m15bos?'/M15':'') + '. Waiting for 50-61.8% pullback.' }};
-                }
-              } else {
-                // All conditions present — run full score
-                const sl  = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
-                const tps = calcTP(sweep.direction, pb.entry, sl, levels);
-
-                if (tps.rr1 < 1.5) {
-                  console.log('[auto-scan] ' + sym + ': R:R ' + tps.rr1 + ' below 1.5 minimum — skip');
-                } else {
-                  // ── FULL SCORING ────────────────────────────────
-                  const scoreResult = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
-                    volatility.ok === true || volatility.ok === undefined,
-                    directionalBias, biasPenalty);
-
-                  console.log('[auto-scan] ' + sym + ' score: ' + scoreResult.total +
-                    ' (' + scoreResult.grade + ')' +
-                    (scoreResult.reason ? ' — ' + scoreResult.reason : ''));
-
-                  if (scoreResult.grade === 'REJECT') {
-                    // Silent discard — no alert for low-quality setups
-                  } else {
-                    // A or A+ setup — generate signal
-                    const expiryMs  = Date.now() + minsLeft * 60 * 1000;
-                    const expiryUTC = new Date(expiryMs).toUTCString().split(' ')[4] + ' UTC';
-                    const reasonParts = [
-                      sess + ' ' + sweep.level.label + ' sweep',
-                      (sweep.direction==='BUY'?'bullish':'bearish') + ' displacement (' + disp.ratio + '× body)',
-                      (m15bos?'M5/M15':'M5') + ' BOS',
-                      pb.retracement + '% pullback entry'
-                    ];
-                    const rawSig = {
-                      id: Date.now(), asset: sym, direction: sweep.direction,
-                      entry: parseFloat(pb.entry.toFixed(3)),
-                      stop_loss: sl, take_profit_1: tps.tp1, take_profit_2: tps.tp2,
-                      rr: tps.rr1, confidence: scoreResult.total,
-                      grade: scoreResult.grade, scoreBreakdown: scoreResult.breakdown,
-                      session: sess, reason: reasonParts.join(' → '),
-                      sweep_level: sweep.level.label, pullback_pct: pb.retracement,
-                      directional_bias: directionalBias, expiry: expiryUTC
-                    };
-                    rawSig.alert = formatSignalAlert(rawSig, currentATR);
-                    signal = rawSig;
-                  }
-                }
+        // Counter-structure: only check PRIMARY ZONE for opposing sweep
+        // (using all levels caused secondary zones to trigger false invalidations)
+        const primaryZoneForCheck = selectPrimaryZone(levels, livePrice, sess, m5);
+        if (primaryZoneForCheck) {
+          const sweep2 = detectSweep(m5, [primaryZoneForCheck]);
+          if (sweep2.found) {
+            const sweep2Corrected = correctSweepDirection(sweep2);
+            if (sweep2Corrected.direction !== setup.direction) {
+              await invalidateSetup(sym, 'Structure broke against ' + setup.direction + ' direction on primary zone.');
+              resetSetup(sym, 'Counter-structure');
+              // Counter-structure sweep = opposite structure confirmed → clear bias
+              if (symTiming[sym]) {
+                symTiming[sym].structuralBiasDir   = sweep2Corrected.direction;
+                symTiming[sym].structuralBiasStage = 'sweep';
+                symTiming[sym].structuralBiasAt    = Date.now();
+                console.log('[bias] ' + sym + ': structural bias flipped → ' +
+                  sweep2Corrected.direction + ' (counter-structure confirmed)');
               }
+              await delay(400); continue;
             }
           }
         }
       }
 
-      // ── SEND ALERTS ───────────────────────────────────────────
+      // ── DETECT MARKET STATE ────────────────────────────────────
+      if (!sessionOk || volatility.ok === false) {
+        await delay(400); continue;
+      }
 
-      if (signal) {
-        const sigKey = sym + '_' + signal.direction + '_' + signal.entry;
-        if (!sentSignals.has(sigKey)) {
-          sentSignals.add(sigKey);
-          setTimeout(() => sentSignals.delete(sigKey), 4 * 60 * 60 * 1000);
+      // ── PRIMARY ZONE SELECTION — only this zone matters ─────────
+      const timing    = symTiming[sym];  // declared here — used throughout this block
+      const structBias = timing
+        ? { dir: timing.structuralBiasDir, stage: timing.structuralBiasStage }
+        : null;
+      const primaryZone = selectPrimaryZone(levels, livePrice, sess, m5, structBias);
+      if (!primaryZone) {
+        console.log('[' + sym + '] No primary zone found — skip');
+        await delay(400); continue;
+      }
 
-          // Register active setup — blocks new signals for this symbol
-          activeSetups[sym] = {
-            direction: signal.direction,
-            entry: signal.entry,
-            startedAt: Date.now(),
-            stage: 'entry_triggered'
-          };
+      // ── ZONE MEMORY: track retest count + gate exhausted zones ──
+      updateZoneMemory(sym, primaryZone);
+      const zoneFreshness = getZoneFreshness(sym, primaryZone);
+      console.log('[zone-mem] ' + sym + ': ' + zoneFreshness.label +
+        ' (session touches: ' + zoneFreshness.touchCount + ')');
+      if (zoneFreshness.suppress) {
+        console.log('[zone-mem] ' + sym + ': EXHAUSTED zone — signal suppressed');
+        await delay(400); continue;
+      }
 
-          console.log('[auto-scan] ' + signal.grade + ' SIGNAL: ' + sym + ' ' +
-            signal.direction + ' @ ' + signal.entry + ' (score ' + signal.confidence + ')');
-          await sendTelegram(formatTelegramSignal(signal));
+      const zoneScore = primaryZone.confidence?.total || 0;
+      console.log('[' + sym + '] Primary zone: ' + primaryZone.direction +
+        ' ' + primaryZone.priceRange + ' score=' + zoneScore + '/100' +
+        (zoneScore >= 75 ? ' [FULL]' : zoneScore >= 60 ? ' [STANDARD]' : ' [BLOCKED]'));
+
+      // ── ZONE DETECTION COOLDOWN ────────────────────────────────
+      // (timing already declared above)
+      if (timing && Date.now() < timing.zoneDetectionAllowedAt) {
+        const waitMins = Math.ceil((timing.zoneDetectionAllowedAt - Date.now()) / 60000);
+        console.log('[timing] ' + sym + ': zone detection cooldown active (' + waitMins + 'min remaining) — skipping');
+        await delay(400); continue;
+      }
+
+      // ── BIAS FLIP PROTECTION (cooldown-based) ──────────────────
+      if (timing && timing.lastInvalidatedDir && Date.now() < timing.biasFlipAllowedAt) {
+        if (primaryZone && primaryZone.direction !== timing.lastInvalidatedDir) {
+          const waitMins = Math.ceil((timing.biasFlipAllowedAt - Date.now()) / 60000);
+          console.log('[timing] ' + sym + ': bias flip blocked — last setup was ' +
+            timing.lastInvalidatedDir + ', opposite direction locked for ' + waitMins + 'min');
+          await delay(400); continue;
         }
       }
 
-      // Pre-signal — only send if no active setup, once per stage per hour
-      if (near_setup && !signal) {
-        const preKey   = sym + '_' + near_setup.stage;
-        const lastSent = sentPreSignals[preKey] || 0;
-        if (Date.now() - lastSent > 60 * 60 * 1000) {
-          sentPreSignals[preKey] = Date.now();
+      // ── STRUCTURAL BIAS GATE ─────────────────────────────────────
+      // If a structural bias is active (sweep/move/trend confirmed in one direction),
+      // block opposite-direction setups until structure confirms the flip.
+      // Counter-trend zones are demoted in selectPrimaryZone but may still win
+      // if no same-direction zone exists — block them here.
+      if (timing && timing.structuralBiasDir && primaryZone) {
+        const biasStage    = timing.structuralBiasStage || 'sweep';
+        const stageStrength = { sweep: 1, move: 2, trend: 3 };
+        const strength      = stageStrength[biasStage] || 1;
 
-          // Track setup progression
-          if (!activeSetups[sym]) {
-            activeSetups[sym] = {
-              direction: near_setup.direction,
-              startedAt: Date.now(),
-              stage: near_setup.stage
-            };
-          } else {
-            activeSetups[sym].stage = near_setup.stage;
+        if (primaryZone.direction !== timing.structuralBiasDir && primaryZone.isCounterTrend) {
+          if (strength >= 2) {
+            // Move or trend confirmed — hard block on counter-trend setup
+            console.log('[bias] ' + sym + ': BUY zone blocked — no bullish structure confirmation' +
+              ' (structural bias: ' + timing.structuralBiasDir + ' at ' + biasStage + ')');
+            await delay(400); continue;
           }
-
-          console.log('[auto-scan] PRE-SIGNAL: ' + sym + ' ' + near_setup.stage);
-          await sendTelegram(formatTelegramPreSignal(sym, near_setup));
+          // Sweep only — allow but log
+          console.log('[bias] ' + sym + ': counter-trend ' + primaryZone.direction +
+            ' zone allowed (bias only at sweep level — monitoring)');
         }
       }
+
+      // ── ZONE SCORE GATE ────────────────────────────────────────
+      // < 60  → no signals at all — zone not strong enough
+      // 60–74 → standard entry only, aggressive engine suppressed
+      // ≥ 75  → full system: standard + aggressive
+      if (zoneScore < 60) {
+        console.log('[' + sym + '] Zone score ' + zoneScore + ' < 60 — all signals suppressed');
+        // Cancel any active setup that depended on this zone
+        if (setup && setup.active) {
+          console.log('[' + sym + '] Cancelling active setup — zone score ' + zoneScore + ' fell below 60');
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 60).');
+          resetSetup(sym, 'Zone score below 60');
+        }
+        await delay(400); continue;
+      }
+
+      // ── ZONE STRENGTH CHECK AT TREND SHIFT+ STAGES ─────────────
+      // If setup has progressed past trend shift but zone score is now < 60,
+      // cancel — do not proceed to pullback or entry with a weak zone.
+      if (setup && setup.active && setup.events?.trend) {
+        if (zoneScore < 60) {
+          console.log('[' + sym + '] Setup cancelled at trend+ stage — zone score ' + zoneScore + ' < 60');
+          await invalidateSetup(sym, 'Setup cancelled: insufficient zone strength for execution (score ' + zoneScore + '/100 < 60).');
+          resetSetup(sym, 'Zone too weak at trend+ stage');
+          await delay(400); continue;
+        }
+      }
+
+      // Detect sweep from primary zone only — non-primary zones ignored
+      let sweep = detectSweep(m5, [primaryZone]); // PRIMARY ZONE ONLY — all secondary zones ignored
+      if (sweep.found) sweep = correctSweepDirection(sweep);
+      const sweepToNow = sweep.found ? (m5.length - 1 - sweep.candleIdx) : 999;
+
+      // ── STAGE: APPROACHING ─────────────────────────────────────
+      // Fire once when price is near a key zone and no setup is active yet
+      if (!setup && !sweep.found) {
+        // Only approach the PRIMARY ZONE — not random levels
+        const nearEdgePz = primaryZone.direction === 'SELL' ? primaryZone.minPrice : primaryZone.maxPrice;
+        const distPctPz  = Math.abs(livePrice - nearEdgePz) / nearEdgePz;
+        const approaching = distPctPz <= 0.005 // within 0.5% of primary zone
+          ? { ...primaryZone, distPct: parseFloat((distPctPz*100).toFixed(3)), dir: primaryZone.direction }
+          : null;
+
+        if (approaching) {
+          // Create setup for this zone, fire approaching event
+          // Validate approaching zone before creating setup
+          const vApproach = validateSignal(sym, { found: true, level: approaching, direction: approaching.dir,
+            wickPct: 0.5 }, m5, levels, setups[sym]);
+          // For approaching, we only check Rules 1-4 (zone not swept yet, so R5-8 N/A)
+          const approachBlocked = vApproach.reasons.filter(r =>
+            !r.includes('Sweep too weak') && !r.includes('candle') && !r.includes('already swept'));
+          if (approachBlocked.length > 0) {
+            console.log('[validate] ' + sym + ': approaching blocked — ' + approachBlocked.join(', '));
+            await delay(400); continue;
+          }
+          const newSetup = createAndLogSetup(sym, approaching.dir, approaching);
+          setups[sym] = newSetup;
+          setup = newSetup;
+          const rangeStr = approaching.isZone
+            ? '$' + parseFloat(approaching.minPrice).toFixed(2) + '–$' + parseFloat(approaching.maxPrice).toFixed(2)
+            : '$' + parseFloat(approaching.price).toFixed(2);
+          await fireEvent(setup, 'approaching', sym, async () => {
+            if (TELEGRAM_MODE === 'FULL') await sendTelegram(
+            asset + ' ' + approaching.dir + ' ZONE\n' +
+            'Range: $' + parseFloat(approaching.minPrice||approaching.price).toFixed(2) + ' – $' + parseFloat(approaching.maxPrice||approaching.price).toFixed(2) + '\n' +
+            'Strength: ' + (approaching.confidence?.total || approaching.score || '—') + '/100\n' +
+            'Touches: ' + (approaching.totalTouches || '—') + '\n\n' +
+            'If price sweeps through and reverses, a ' + approaching.dir + ' setup may form.\n\n' +
+            '⏳ No action yet — monitoring.\n\n─────────────────\nAurum Signals'
+            );
+          });
+        }
+        await delay(400); continue;
+      }
+
+      // ── STAGE: SWEEP DETECTED ──────────────────────────────────
+      if (!sweep.found || sweepToNow > 10) {
+        await delay(400); continue;
+      }
+
+      // New sweep on a DIFFERENT zone than current setup → reset
+      if (setup && sweep.found) {
+        const newZoneId = sweep.level && sweep.level.isZone
+          ? Math.round(sweep.level.minPrice) + '-' + Math.round(sweep.level.maxPrice)
+          : Math.round(parseFloat(sweep.level?.price || 0));
+        if (setup.zoneId && setup.zoneId !== String(newZoneId)) {
+          console.log('[' + sym + '] New sweep on different zone — resetting setup');
+          resetSetup(sym, 'New sweep on different zone');
+          setup = null;
+        }
+      }
+
+      // Respect early entry lock — block new setups for 2 candles after AGGRESSIVE_EARLY
+      const priorSetup = setups[sym];
+      if (priorSetup && priorSetup.earlyLockUntil && Date.now() < priorSetup.earlyLockUntil) {
+        const lockMins = Math.ceil((priorSetup.earlyLockUntil - Date.now()) / 60000);
+        console.log('[lock] ' + sym + ': early entry lock active (' + lockMins + 'min remaining) — ignoring new sweep');
+        await delay(400); continue;
+      }
+
+      // Validate before creating any setup
+      if (!setup) {
+        const vResult = validateSignal(sym, sweep, m5, levels, null);
+        if (!vResult.valid) {
+          console.log('[validate] ' + sym + ': setup creation blocked (' + vResult.reasons.length + ' failures)');
+          await delay(400); continue;
+        }
+        setup = createAndLogSetup(sym, sweep.direction, sweep.level);
+        setups[sym] = setup;
+        console.log('[validate] ' + sym + ': setup passed all 8 rules — created id=' + setup.id);
+      }
+
+      // Block if already invalidated
+      if (setup.invalidated) {
+        console.log('[' + sym + '] Setup invalidated — skipping signal engine');
+        await delay(400); continue;
+      }
+
+      const lvlDesc = sweep.level && sweep.level.isZone
+        ? sweep.level.label + ' (' + sweep.level.priceRange + ')'
+        : (sweep.level?.label || 'key level');
+
+      // Track timing for cooldown
+      const newSweepKey = sweep.direction + '_' +
+        (sweep.level?.isZone ? Math.round(sweep.level.minPrice) + '-' + Math.round(sweep.level.maxPrice)
+                             : Math.round(sweep.level?.price || 0));
+      const SWEEP_COOLDOWN_MS = 3 * CANDLE_MS;
+      const isDupeSweep = timing &&
+          timing.lastSweepDir === sweep.direction &&
+          timing.lastSweepZoneKey !== newSweepKey &&
+          Date.now() - timing.lastSweepAlertAt < SWEEP_COOLDOWN_MS;
+
+      if (isDupeSweep) {
+        console.log('[zone-merge] ' + sym + ': sweep alert suppressed (same direction, overlapping zone, within cooldown)');
+      }
+
+      const sweepFired = await fireEvent(setup, 'sweep', sym, async () => {
+        // Record sweep alert timing
+        if (timing) {
+          timing.lastSweepAlertAt  = Date.now();
+          timing.lastSweepDir      = sweep.direction;
+          timing.lastSweepZoneKey  = newSweepKey;
+        }
+        if (!isDupeSweep && TELEGRAM_MODE === 'FULL') {
+          await sendTelegram(
+            '⚡ <b>' + asset + ' — LIQUIDITY GRAB DETECTED</b>\n\n' +
+            asset + ' swept ' + lvlDesc + ' and closed back inside.\n' +
+            'Direction: <b>' + sweep.direction + '</b>\n\n' +
+            '⏳ Waiting for a strong displacement candle.\n\n─────────────────\nAurum Signals'
+          );
+        }
+      }, sweep.candleIdx);
+
+      // ── STAGE GATE: if sweep just fired this scan, stop here ──
+      // Forces each stage to be confirmed on a separate scan cycle.
+      // Prevents bulk-confirmation of multiple stages from historical data.
+      if (sweepFired) {
+        logStageUpdate(setup, 'sweep');
+        // Record structural bias at sweep stage
+        if (timing) {
+          timing.structuralBiasDir   = sweep.direction;
+          timing.structuralBiasStage = 'sweep';
+          timing.structuralBiasAt    = Date.now();
+          console.log('[bias] ' + sym + ': structural bias set → ' + sweep.direction + ' (sweep stage)');
+        }
+        console.log('[' + sym + '] Sweep fired this scan — waiting for next scan before displacement');
+        await delay(400); continue;
+      }
+
+      // ── STAGE: DISPLACEMENT (MOVE) ────────────────────────────
+      // HTF counter-bias: require stronger displacement (1.5× instead of default)
+      const _htfBiasNow = timing?.htfBias || 'NEUTRAL';
+      const _htfCounter = (_htfBiasNow === 'BULLISH' && sweep.direction === 'SELL') ||
+                          (_htfBiasNow === 'BEARISH' && sweep.direction === 'BUY');
+      const dispMinRatio = _htfCounter ? 1.5 : 1.2; // stricter for counter-HTF setups
+
+      const disp = detectDisplacement(m5, sweep.candleIdx, sweep.direction, dispMinRatio);
+      if (!disp.found) {
+        if (_htfCounter) {
+          console.log('[htf] ' + sym + ': counter-HTF setup — displacement must be ≥' + dispMinRatio + '× avg');
+        }
+        console.log('[' + sym + '] Waiting for displacement');
+        await delay(400); continue;
+      }
+
+      const moveFired = await fireEvent(setup, 'move', sym, async () => {
+        if (TELEGRAM_MODE === 'FULL') {
+          await sendTelegram(
+            '↗️ <b>' + asset + ' — STRONG MOVE CONFIRMED</b>\n\n' +
+            'A ' + disp.ratio + '× displacement candle followed the liquidity grab.\n' +
+            'Direction: <b>' + sweep.direction + '</b>\n\n' +
+            '⏳ Waiting for break of structure.\n\n─────────────────\nAurum Signals'
+          );
+        }
+      }, disp.candleIdx);
+
+      if (moveFired) {
+        logStageUpdate(setup, 'move');
+        if (timing) {
+          timing.structuralBiasDir   = sweep.direction;
+          timing.structuralBiasStage = 'move';
+          timing.structuralBiasAt    = Date.now();
+          console.log('[bias] ' + sym + ': structural bias strengthened → ' + sweep.direction + ' (move stage)');
+        }
+        console.log('[' + sym + '] Move fired this scan — waiting for next scan before BOS');
+        await delay(400); continue;
+      }
+
+      // ── VWAP RECLAIM CHECK ─────────────────────────────────────
+      // Confirms price reclaimed session VWAP after the sweep.
+      // Soft-block: logs only for 2 weeks, then harden to hard-stop.
+      const vwapCheck = detectVWAPReclaim(m5, sweep.candleIdx, sweep.direction);
+      console.log('[vwap] ' + sym + ': ' + vwapCheck.note);
+      if (!vwapCheck.reclaimed) {
+        const candlesSinceSweep = m5.length - 1 - sweep.candleIdx;
+        if (candlesSinceSweep > 4) {
+          console.log('[vwap] ' + sym + ': no VWAP reclaim in ' + candlesSinceSweep +
+            ' candles — weak follow-through (soft-logged)');
+        }
+      }
+
+      // ── STAGE: TREND SHIFT (BOS) ──────────────────────────────
+      const bos = detectBOS(m5, sweep.candleIdx, sweep.direction);
+      if (!bos.found) {
+        console.log('[' + sym + '] Waiting for BOS');
+        await delay(400); continue;
+      }
+
+      const m15bos = m15.length >= 8 ? confirmBOS_M15(m15, sweep.direction, bos.bos_level) : false;
+      const trendFired = await fireEvent(setup, 'trend', sym, async () => {
+        if (TELEGRAM_MODE === 'FULL') {
+          await sendTelegram(
+            '✅ <b>' + asset + ' — TREND SHIFT CONFIRMED</b>\n\n' +
+            'Break of structure confirmed on M5' + (m15bos ? '/M15' : '') + '.\n' +
+            'Direction: <b>' + sweep.direction + '</b>\n\n' +
+            '⏳ Waiting for 50–61.8% pullback into entry zone.\n\n─────────────────\nAurum Signals'
+          );
+        }
+      }, bos.candleIdx);
+
+      if (trendFired) {
+        logStageUpdate(setup, 'trend');
+        if (timing) {
+          timing.structuralBiasDir   = sweep.direction;
+          timing.structuralBiasStage = 'trend';
+          timing.structuralBiasAt    = Date.now();
+          console.log('[bias] ' + sym + ': structural bias confirmed → ' + sweep.direction + ' (BOS stage)');
+        }
+        // PRE-ENTRY ALERT: send at trend confirmation (not pullback)
+        // This ensures alert fires even if pullback immediately exceeds 70%
+        if (TELEGRAM_MODE !== 'FULL' && setup && !setup.tgAlerts?.preEntry) {
+          if (setup.tgAlerts) setup.tgAlerts.preEntry = true;
+          const _htfNow     = timing?.htfBias || 'NEUTRAL';
+          const _htfAligned = (_htfNow === 'BULLISH' && sweep.direction === 'BUY') ||
+                              (_htfNow === 'BEARISH' && sweep.direction === 'SELL');
+          const _htfCounter = (_htfNow === 'BULLISH' && sweep.direction === 'SELL') ||
+                              (_htfNow === 'BEARISH' && sweep.direction === 'BUY');
+          const _htfLine    = _htfNow === 'NEUTRAL'
+            ? 'HTF Bias: Neutral ➖'
+            : _htfAligned
+              ? 'HTF Bias: ' + _htfNow.charAt(0) + _htfNow.slice(1).toLowerCase() + ' ✅ (aligned)'
+              : 'HTF Bias: ' + _htfNow.charAt(0) + _htfNow.slice(1).toLowerCase() + ' ❌ (counter — stronger confirmation required)';
+          await sendTelegram(
+            '⚠️ <b>' + asset + ' ' + sweep.direction + ' — SETUP FORMING</b>\n\n' +
+            'Zone: $' + parseFloat(primaryZone.minPrice).toFixed(2) +
+            ' – $' + parseFloat(primaryZone.maxPrice).toFixed(2) + '\n' +
+            'Confidence: ' + zoneScore + '/100\n' +
+            'Touches: ' + primaryZone.totalTouches + '\n' +
+            _htfLine + '\n\n' +
+            'Status: Waiting for pullback into entry zone.\n\n' +
+            '⏳ No action yet — monitor closely.\n\n─────────────────\nAurum Signals'
+          );
+        }
+        console.log('[' + sym + '] Trend fired this scan — waiting for next scan before pullback');
+        await delay(400); continue;
+      }
+
+      // ── STAGE: PULLBACK ───────────────────────────────────────
+      // Invalidation delay: after trend shift, wait at least 1 candle before
+      // evaluating pullback. Prevents instant invalidation on same scan as BOS.
+      const trendCandleIdx = setup.stageCandleIdx?.trend ?? bos.candleIdx;
+      const candlesSinceTrend = (m5.length - 1) - trendCandleIdx;
+      if (candlesSinceTrend < 2) {
+        console.log('[timing] ' + sym + ': trend confirmed at candle ' + trendCandleIdx +
+          ' — invalidation blocked (' + candlesSinceTrend + '/2 candles elapsed)');
+        await delay(400); continue;
+      }
+
+      const pb = detectPullback(m5, disp.candleIdx, sweep.direction, sweep.sweepExtreme);
+
+      // Track pullback candle count — need min 2 candles of structure before 70% invalidation
+      const curCandleIdx = m5.length - 1;
+      if (timing) {
+        if (!pb.found && timing.pullbackStartCandleIdx < 0) {
+          // First scan where pullback is being evaluated
+          timing.pullbackStartCandleIdx = curCandleIdx;
+          timing.pullbackCandleCount    = 0;
+        } else if (!pb.found && timing.pullbackStartCandleIdx >= 0) {
+          timing.pullbackCandleCount = curCandleIdx - timing.pullbackStartCandleIdx;
+        }
+      }
+      const pullbackCandles = timing ? timing.pullbackCandleCount : 99;
+
+      if (!pb.found) {
+        if (pb.reason && pb.reason.includes('70%')) {
+          if (pullbackCandles < 2) {
+            console.log('[timing] ' + sym + ': 70% invalidation skipped — only ' +
+              pullbackCandles + ' pullback candle(s) formed (min 2 required)');
+            await delay(400); continue;
+          }
+          await invalidateSetup(sym, 'Pullback exceeded 70% retracement.');
+          resetSetup(sym, 'Pullback > 70%');
+        } else {
+          console.log('[' + sym + '] Waiting for pullback (candle ' + curCandleIdx + ')');
+        }
+        await delay(400); continue;
+      }
+
+      const pullbackFired = await fireEvent(setup, 'pullback', sym, async () => {
+        if (TELEGRAM_MODE === 'FULL') {
+          await sendTelegram(
+            '🎯 <b>' + asset + ' — PULLBACK INTO ENTRY ZONE</b>\n\n' +
+            'Price pulled back ' + pb.retracement + '% into the entry zone.\n' +
+            'Preparing to evaluate full signal.\n\n' +
+            '⏳ Running quality checks...\n\n─────────────────\nAurum Signals'
+          );
+        }
+        // Pre-entry alert already sent at trend stage — nothing extra needed here
+      }, pb.candleIdx);
+      if (pullbackFired) logStageUpdate(setup, 'pullback');
+
+      // ── STAGE: ENTRY SIGNAL ───────────────────────────────────
+      // Run aggressive entry engine — gated by zone score
+      // Zone score < 75 → aggressive engine suppressed, standard only
+      // Zone score ≥ 75 → full aggressive engine enabled
+      const allowAggressive = zoneScore >= 75;
+      const entryResult = allowAggressive
+        ? aggressiveEntryEngine(sym, m5, primaryZone, sess)
+        : { type: 'NO_ENTRY', reason: 'Zone score ' + zoneScore + ' < 75 — aggressive suppressed' };
+      if (!allowAggressive) {
+        console.log('[' + sym + '] Zone score ' + zoneScore + ' — aggressive engine suppressed (standard only)');
+      }
+
+      // If engine sees no valid entry pattern at this exact moment, defer
+      // SWEEP_FORMING: sweep valid, momentum not yet confirmed — wait
+      if (entryResult.type === 'SWEEP_FORMING') {
+        console.log('[' + sym + '] Aggressive engine: sweep forming — ' + entryResult.reason);
+        await delay(400); continue;
+      }
+      // NO_ENTRY with momentum timeout — send specific invalidation once
+      if (entryResult.type === 'NO_ENTRY' && entryResult.reason?.includes('window expired') && setup) {
+        if (!setup.momentumTimeoutSent && (TELEGRAM_MODE === 'FULL' || setup.tgAlerts?.preEntry || setup.events?.pullback)) {
+          setup.momentumTimeoutSent = true;
+          const _asset2  = sym === 'XAUUSD' ? 'GOLD' : 'SILVER';
+          const _oppDir  = setup.direction === 'BUY' ? 'SELL' : 'BUY';
+          const _oppEmoji= _oppDir === 'BUY' ? '🟢' : '🔴';
+          const _t2      = symTiming[sym];
+          if (_t2) {
+            _t2.structuralBiasDir   = _oppDir;
+            _t2.structuralBiasStage = 'sweep';
+            _t2.consecutiveFailures[setup.direction] = (_t2.consecutiveFailures[setup.direction]||0)+1;
+          }
+          await sendTelegram('❌ <b>' + _asset2 + ' — SETUP INVALIDATED</b>\n\n' +
+            'No momentum confirmed after liquidity sweep.\n' +
+            'The 2-candle window expired without confirmation.\n\n' +
+            _oppEmoji + ' ' + setup.direction + ' setup failed — short-term ' + _oppDir +
+            ' bias active.\n\n─────────────────\nAurum Signals');
+        }
+      }
+      if (entryResult.type === 'NO_ENTRY') {
+        const isMomentumTimeout = entryResult.reason?.includes('expired');
+        console.log('[' + sym + '] Aggressive engine: ' +
+          (isMomentumTimeout ? '⚠ momentum timeout — ' : 'no pattern — ') + entryResult.reason);
+        // Don't block structural path — fall through to standard score gate
+      }
+      if (entryResult.type === 'ENTRY_READY') {
+        const modeLabel = entryResult.mode === 'AGGRESSIVE_EARLY' ? 'AGGRESSIVE_EARLY' : 'AGGRESSIVE';
+        console.log('[' + sym + '] Engine: ' + modeLabel + ' ENTRY_READY — confidence=' +
+          entryResult.confidence + ' | ' + (entryResult.entry_reason?.[0] || ''));
+      }
+
+      const sl  = calcSL(sweep.direction, sweep.sweepExtreme, currentATR || 0.5);
+      const tps = calcTP(sweep.direction, pb.entry, sl, levels);
+
+      if (tps.rr1 < 1.5) {
+        console.log('[' + sym + '] R:R ' + tps.rr1 + ' below minimum — no signal');
+        await delay(400); continue;
+      }
+
+      const avgRange = m5.slice(-10).reduce((s,c) => s + range(c), 0) / 10;
+      const qf = runQualityFilters(m5, m15, sweep, disp, bos, pb,
+        levels, sweep.direction, parseFloat(pb.entry.toFixed(3)), tps.tp1, sess, avgRange);
+      if (!qf.pass) {
+        console.log('[' + sym + '] Quality filter [' + qf.failedFilter + ']: ' + qf.reason);
+        await delay(400); continue;
+      }
+
+      const scoreResult = scoreSetup(sess, sessionOk, sweep, disp, bos, pb,
+        volatility.ok === true || volatility.ok === undefined, directionalBias, biasPenalty);
+
+      // Aggressive engine boosts score when it confirms — additive, not replacement
+      // Standard score gate still applies regardless
+      let finalScore = scoreResult.total;
+      if (entryResult.type === 'ENTRY_READY') {
+        // Blend: average of structural score and aggressive confidence, +5 bonus
+        finalScore = Math.min(Math.round((scoreResult.total + entryResult.confidence) / 2) + 5, 100);
+        scoreResult.total = finalScore;
+        scoreResult.grade = finalScore >= 85 ? 'A+' : finalScore >= 75 ? 'A' : scoreResult.grade;
+        scoreResult.tier  = finalScore >= 75 ? 'HIGH' : scoreResult.tier;
+        console.log('[' + sym + '] Score: ' + scoreResult.total + ' → ' + finalScore +
+          ' (structural + aggressive confirmation) (' + scoreResult.grade + ')');
+      } else {
+        finalScore = scoreResult.total;
+        console.log('[' + sym + '] Score: ' + finalScore + ' (' + scoreResult.grade + ')' +
+          (entryResult.type === 'NO_ENTRY' ? ' [aggressive engine: no pattern]' : ''));
+      }
+
+      // Tier gate: only HIGH (≥75) gets a full signal
+      if (scoreResult.tier !== 'HIGH') {
+        console.log('[' + sym + '] Score ' + finalScore + ' tier=' + scoreResult.tier + ' — below 75 threshold');
+        await delay(400); continue;
+      }
+
+      // ── HARD ENTRY GATE — ALL prior stages must be confirmed ────
+      // This is the final safety check before any signal is sent.
+      // Prevents entry if any upstream stage was skipped or not confirmed.
+      const requiredStages = ['sweep', 'move', 'trend', 'pullback'];
+      const missingStages  = requiredStages.filter(st => !setup.events[st]);
+      if (missingStages.length > 0) {
+        console.log('[' + sym + '] Entry blocked — missing confirmed stages: ' + missingStages.join(', '));
+        await delay(400); continue;
+      }
+      if (setup.invalidated) {
+        console.log('[' + sym + '] Entry blocked — setup already invalidated');
+        await delay(400); continue;
+      }
+
+      // ── GENERATE FULL SIGNAL ──────────────────────────────────
+      const sigKey = sym + '_' + sweep.direction + '_' + parseFloat(pb.entry.toFixed(2));
+      if (sentSignals.has(sigKey)) {
+        console.log('[' + sym + '] Signal already sent for this entry — blocked');
+        await delay(400); continue;
+      }
+
+      const expiryUTC = new Date(Date.now() + minsLeft * 60000).toUTCString().split(' ')[4] + ' UTC';
+      const rawSig = {
+        id: Date.now(), asset: sym, direction: sweep.direction,
+        entry: parseFloat(pb.entry.toFixed(3)),
+        live_price: livePrice,
+        stop_loss: sl, take_profit_1: tps.tp1, take_profit_2: tps.tp2,
+        rr: tps.rr1, confidence: scoreResult.total,
+        grade: scoreResult.grade, tier: scoreResult.tier, scoreBreakdown: scoreResult.breakdown,
+        entry_mode: entryResult.type === 'ENTRY_READY' ? entryResult.mode : 'STANDARD',
+        session: sess, directional_bias: directionalBias,
+        sweep_level: sweep.level?.label || '—',
+        pullback_pct: pb.retracement, expiry: expiryUTC,
+        atr: currentATR,                               // v5.2: position sizing
+        zoneFreshness: zoneFreshness?.label || null,   // v5.2: zone memory label
+        primaryZone: primaryZone
+          ? { low: primaryZone.minPrice, high: primaryZone.maxPrice }
+          : null,
+        reason: sess + ' ' + (sweep.level?.label||'') + ' sweep → ' +
+          sweep.direction.toLowerCase() + ' displacement (' + disp.ratio + '×) → BOS → ' + pb.retracement + '% pullback'
+      };
+      rawSig.alert = formatSignalAlert(rawSig, currentATR);
+
+      await fireEvent(setup, 'entry', sym, async () => {
+        sentSignals.add(sigKey);
+        setTimeout(() => sentSignals.delete(sigKey), 4 * 60 * 60 * 1000);
+        setup.active = false;
+        if (setup.tgAlerts) setup.tgAlerts.entry = true;
+        // Log entry
+        logEntryTriggered(setup, rawSig.entry, rawSig.stop_loss, [rawSig.take_profit_1, rawSig.take_profit_2].filter(Boolean));
+        // Start trade result monitor
+        tradeMonitor[sym] = {
+          setupId:      setup.id,
+          direction:    rawSig.direction,
+          entry:        rawSig.entry,
+          sl:           rawSig.stop_loss,
+          tp1:          rawSig.take_profit_1,
+          tp2:          rawSig.take_profit_2,
+          maxFav:       rawSig.entry,
+          resultLogged: false,
+          startedAt:    Date.now(),
+        };
+        console.log('[monitor] ' + sym + ': trade monitor started — ' +
+          rawSig.direction + ' entry=' + rawSig.entry + ' SL=' + rawSig.stop_loss +
+          ' TP1=' + rawSig.take_profit_1 + ' TP2=' + rawSig.take_profit_2);
+        // Early entry lock: if AGGRESSIVE_EARLY mode, freeze for 2 candles (10 min)
+        if (entryResult.type === 'ENTRY_READY' && entryResult.mode === 'AGGRESSIVE_EARLY') {
+          setup.earlyLockUntil = Date.now() + 10 * 60 * 1000; // 10 min = 2 × M5 candles
+          console.log('[lock] ' + sym + ': AGGRESSIVE_EARLY lock active for 10 min');
+        }
+        await sendTelegram(formatTelegramSignal(rawSig));
+      });
 
     } catch(e) {
       console.error('[auto-scan] Error for ' + sym + ':', e.message);
     }
-
     await delay(400);
   }
 }
@@ -1649,4 +4043,6 @@ app.listen(PORT, () => {
   // Run once immediately on startup (after 10s to let server settle)
   setTimeout(autoScan, 10000);
   console.log('[scheduler] Auto-scan started — every 5 minutes during sessions');
+  // Restore last 24h of logs from Sheets after Railway restarts
+  hydrateFromSheets(_setupLogs).catch(e => console.error('[boot-hydrate]', e.message));
 });
