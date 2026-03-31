@@ -7,7 +7,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="theme-color" content="#0d0d10">
 <link rel="manifest" href="manifest.json">
-<title>Aurum — Liquidity Sweep Signals</title>
+<title>Aurum v5.3 — Adaptive Signal Engine</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box;}
@@ -573,13 +573,31 @@ canvas{width:100% !important;display:block;}
     <div class="stat-cell"><div class="stat-lbl">Entries</div><div class="stat-val good" id="st-entries">—</div><div class="stat-sub">signals fired</div></div>
     <div class="stat-cell"><div class="stat-lbl">Invalidations</div><div class="stat-val bad" id="st-inv">—</div><div class="stat-sub">before entry</div></div>
   </div>
-  <div class="sh" style="margin-top:1px"><span class="st">BY SESSION</span></div>
-  <div id="st-session" style="padding:12px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+
+  <div class="sh" style="margin-top:4px"><span class="st">OPEN TRADES</span></div>
+  <div id="st-open" style="padding:10px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+
+  <div class="sh"><span class="st">BY SESSION</span></div>
+  <div id="st-session" style="padding:10px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+
   <div class="sh"><span class="st">BY DIRECTION</span></div>
-  <div id="st-dir" style="padding:12px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+  <div id="st-dir" style="padding:10px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+
+  <div class="sh"><span class="st">BY ENTRY TYPE</span><span style="font-size:9px;color:var(--txt3);margin-left:8px">pullback vs continuation</span></div>
+  <div id="st-entrytype" style="padding:10px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+
+  <div class="sh"><span class="st">BY PULLBACK TIER</span><span style="font-size:9px;color:var(--txt3);margin-left:8px">optimal vs valid vs weak</span></div>
+  <div id="st-pbtier" style="padding:10px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+
+  <div class="sh"><span class="st">BY DISPLACEMENT STRENGTH</span><span style="font-size:9px;color:var(--txt3);margin-left:8px">strong (≥1.5×) vs valid (1.2–1.5×)</span></div>
+  <div id="st-disp" style="padding:10px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+
+  <div class="sh"><span class="st">BY BOS TYPE</span><span style="font-size:9px;color:var(--txt3);margin-left:8px">M5 only vs M5+M15</span></div>
+  <div id="st-bos" style="padding:10px 18px;font-family:var(--mono);font-size:10px;color:var(--txt2);">—</div>
+
   <div class="sh"><span class="st">RECENT SETUPS</span></div>
   <div id="st-recent" style="padding:8px 18px;font-size:10px;"></div>
-  <div style="height:40px"></div>
+
       <div class="pw">
         <div class="sg">
           <div class="sb2"><div class="sl2">TOTAL SETUPS</div><div class="sv2" id="p-tot">0</div><div class="ss">Signals generated</div></div>
@@ -598,6 +616,7 @@ canvas{width:100% !important;display:block;}
           <button class="ob" onclick="logOut()">LOG →</button>
         </div>
       </div>
+  <div style="height:40px"></div>
     </div>
 
     <!-- ALERTS -->
@@ -615,8 +634,8 @@ canvas{width:100% !important;display:block;}
           <div class="ar"><span class="al">Gold (XAUUSD)</span><label class="tgl"><input type="checkbox" id="f-xau" checked onchange="savePr()"><div class="ttr"></div></label></div>
           <div class="ar"><span class="al">Silver (XAGUSD)</span><label class="tgl"><input type="checkbox" id="f-xag" checked onchange="savePr()"><div class="ttr"></div></label></div>
           <div style="padding:8px 0 4px">
-            <span class="al" style="display:block;margin-bottom:6px;font-size:11px;color:var(--txt2)">Min Confidence: <span id="conf-v" style="color:var(--gold);font-family:var(--mono)">80%</span></span>
-            <input type="range" min="70" max="95" value="80" id="min-conf" style="width:100%;accent-color:var(--gold)" oninput="document.getElementById('conf-v').textContent=this.value+'%';savePr()">
+            <span class="al" style="display:block;margin-bottom:6px;font-size:11px;color:var(--txt2)">Min Confidence: <span id="conf-v" style="color:var(--gold);font-family:var(--mono)">70%</span></span>
+            <input type="range" min="60" max="95" value="70" id="min-conf" style="width:100%;accent-color:var(--gold)" oninput="document.getElementById('conf-v').textContent=this.value+'%';savePr()">
           </div>
         </div>
         <div class="acard">
@@ -928,7 +947,7 @@ async function scan(btn){
 
     const fxau = document.getElementById('f-xau')?.checked !== false;
     const fxag = document.getElementById('f-xag')?.checked !== false;
-    const mc   = parseInt(document.getElementById('min-conf')?.value||80);
+    const mc   = parseInt(document.getElementById('min-conf')?.value||70);
     // 25-second timeout per symbol — prevents infinite hang if Twelve Data is slow
     const analyzeWithTimeout = (sym) => Promise.race([
       fetch(`${SRV}/analyze/${sym}`).then(r=>r.json()),
@@ -1754,12 +1773,12 @@ function renderFeed(){
     const exec       = alert.execution || 'Wait for a pullback into the entry zone before executing.';
     const biasText   = str.bias || '—';
     const confText   = str.confidence || (sig.confidence + '%');
-    const techNote   = 'Swept: ' + (sig.sweep_level||'—') + ' @ $' + (sig.sweep_level_price||'—') +
-                       ' · Wick ' + (sig.wick_pct||'—') + '% · ' + (sig.disp_ratio||'—') + 'x move' +
-                       ' · ' + (sig.structure_type||'external') + ' trend shift' +
-                       (sig.bos_method==='wick+followthrough' ? ' (wick+follow-through)' : '') +
-                       ' · M15: ' + (sig.m15_bos ? 'yes' : 'no') +
-                       ' · Pullback: ' + (sig.pullback_pct||'—') + '%';
+    const techNote   = 'Type: ' + (sig.entryType||'PULLBACK') +
+                       ' · Swept: ' + (sig.sweep_level||'—') +
+                       ' · Disp: ' + (sig.displacementRatio||sig.disp_ratio||'—') + '× [' + (sig.displacementStrength||'—') + ']' +
+                       ' · BOS: ' + (sig.bosType||'M5') +
+                       (sig.pullback_pct ? ' · PB: ' + sig.pullback_pct + '% (' + (sig.pullbackTierLabel||sig.pullbackTier||'—') + ')' : ' · No pullback') +
+                       ' · Confidence: ' + (sig.confidence||'—') + '/100';
 
     return (
       '<div class="alert-card ' + (isBuy ? 'buy-c' : 'sell-c') + '">' +
@@ -1768,6 +1787,8 @@ function renderFeed(){
         '<div class="ac-header">' +
           '<div class="ac-headline ' + (isBuy ? 'buy' : 'sell') + '">' + headline + '</div>' +
           '<div class="ac-badges">' + newBadge +
+            '<span class="ac-badge" style="' + typeCls + ';background:var(--bg3)">' + typeLabel + '</span>' +
+            '<span class="ac-badge ' + (sig.entryType==='CONTINUATION'?'cont':'') + '">' + (sig.entryType==='CONTINUATION'?'⚡ CONTINUATION':'PULLBACK') + '</span>' +
             '<span class="ac-badge sess">' + (sig.session||'—') + '</span>' +
             '<span class="ac-badge ' + confCls + '">' + sig.confidence + ' · ' + tierLabel + '</span>' +
           '</div>' +
@@ -1778,6 +1799,19 @@ function renderFeed(){
         '<div class="ac-section">' +
           '<div class="ac-section-label">What happened</div>' +
           '<div class="ac-context">' + context + '</div>' +
+          '<div style="font-size:10px;color:var(--txt3);margin-top:4px;font-style:italic">' + qualLabel + '</div>' +
+          contWarn +
+        '</div>' +
+
+        // ── SETUP QUALITY (v5.3)
+        '<div class="ac-section">' +
+          '<div class="ac-section-label">Setup quality</div>' +
+          '<div class="ac-strength">' +
+            '<div class="ac-str-item"><div class="ac-str-l">DISPLACEMENT</div><div class="ac-str-v">' + (sig.displacementRatio||'—') + '× <span style="color:var(--txt3);font-size:9px">[' + (sig.displacementStrength||'—') + ']</span></div></div>' +
+            '<div class="ac-str-item"><div class="ac-str-l">BOS TYPE</div><div class="ac-str-v" style="color:' + (sig.bosType==='M5+M15'?'var(--buy)':'var(--txt2)') + '">' + (sig.bosType||'M5') + '</div></div>' +
+            '<div class="ac-str-item"><div class="ac-str-l">PULLBACK</div><div class="ac-str-v">' + (isCont ? '<span style="color:var(--warn)">None</span>' : (sig.pullback_pct||'—') + '% <span style="color:var(--txt3);font-size:9px">(' + (sig.pullbackTierLabel||sig.pullbackTier||'—') + ')</span>') + '</div></div>' +
+            '<div class="ac-str-item"><div class="ac-str-l">ZONE</div><div class="ac-str-v" style="font-size:9px">' + (sig.zoneFreshness||'—') + '</div></div>' +
+          '</div>' +
         '</div>' +
 
         // ── TRADE LEVELS
@@ -1791,7 +1825,7 @@ function renderFeed(){
           '</div>' +
           '<div class="ac-strength" style="margin-top:1px">' +
             '<div class="ac-str-item"><div class="ac-str-l">RISK / REWARD</div><div class="ac-str-v" style="color:var(--warn)">' + (trade.rr || '1:'+sig.rr) + '</div></div>' +
-            '<div class="ac-str-item"><div class="ac-str-l">CONFIDENCE</div><div class="ac-str-v" style="color:' + (tier==='HIGH'?'var(--buy)':tier==='VALID'?'var(--warn)':'var(--txt3)') + '">' + sig.confidence + '/100 — ' + tier + '</div></div>' +
+            '<div class="ac-str-item"><div class="ac-str-l">CONFIDENCE</div><div class="ac-str-v" style="color:' + (tier==='HIGH'?'var(--buy)':tier==='VALID'?'var(--warn)':'var(--txt3)') + '">' + sig.confidence + '/100</div></div>' +
             '<div class="ac-str-item"><div class="ac-str-l">MARKET BIAS</div><div class="ac-str-v">' + biasText + '</div></div>' +
           '</div>' +
         '</div>' +
@@ -1935,7 +1969,7 @@ function savePr(){
   prefs.nearSetup=document.getElementById('t-near')?.checked!==false;
   prefs.sound=document.getElementById('t-sound')?.checked;
   prefs.toast=document.getElementById('t-toast')?.checked!==false;
-  prefs.minConf=parseInt(document.getElementById('min-conf')?.value||80);
+  prefs.minConf=parseInt(document.getElementById('min-conf')?.value||70);
   localStorage.setItem('au4_p',JSON.stringify(prefs));
 }
 function loadPr(){
@@ -1943,7 +1977,7 @@ function loadPr(){
   if(prefs.nearSetup!==false){const e=document.getElementById('t-near');if(e)e.checked=true;}
   if(prefs.sound){const e=document.getElementById('t-sound');if(e)e.checked=true;}
   if(prefs.toast!==false){const e=document.getElementById('t-toast');if(e)e.checked=true;}
-  if(prefs.minConf){const e=document.getElementById('min-conf');if(e){e.value=prefs.minConf;document.getElementById('conf-v').textContent=prefs.minConf+'%';}}
+  if(prefs.minConf){const e=document.getElementById('min-conf');if(e){e.value=prefs.minConf;document.getElementById('conf-v').textContent=(prefs.minConf||70)+'%';}}
 }
 // ── SMART AUTO-REFRESH ENGINE ────────────────────────────────────────────────
 // Scans every 5 minutes when page/app is visible and in session.
@@ -2042,48 +2076,143 @@ async function loadStats() {
     set('st-entries', d.entriesTriggered ?? '—', 'good');
     set('st-inv',     d.invalidations ?? '—', 'bad');
 
-    // Session breakdown
+    const mono = 'font-family:var(--mono);font-size:10px';
+    const rowStyle = 'margin-bottom:5px;display:flex;gap:12px;align-items:center;padding:4px 0;border-bottom:1px solid var(--line2)';
+
+    function winRateStr(obj) {
+      const res = obj.wins + obj.losses;
+      return res > 0 ? Math.round(obj.wins / res * 100) + '%' : '—';
+    }
+
+    // ── Session breakdown ──────────────────────────────────────
     const sess = document.getElementById('st-session');
     if (sess && d.bySession) {
-      sess.innerHTML = Object.entries(d.bySession).map(([s,v]) =>
-        '<div style="margin-bottom:4px;display:flex;gap:16px">' +
-        '<span style="color:var(--txt3);width:60px">' + s + '</span>' +
-        '<span>' + v.setups + ' setups</span>' +
-        '<span style="color:var(--buy)">' + v.entries + ' entries</span>' +
-        '<span style="color:var(--gold)">' + v.wins + ' wins</span>' +
+      sess.innerHTML = Object.entries(d.bySession).map(([s, v]) =>
+        '<div style="' + rowStyle + '">' +
+        '<span style="color:var(--txt3);width:80px;' + mono + '">' + s + '</span>' +
+        '<span style="' + mono + '">' + v.setups + ' setups</span>' +
+        '<span style="color:var(--buy);' + mono + '">' + v.entries + ' entries</span>' +
+        '<span style="color:var(--gold);' + mono + '">' + v.wins + 'W ' + v.losses + 'L</span>' +
+        '<span style="color:var(--txt2);' + mono + '">' + winRateStr(v) + ' WR</span>' +
         '</div>'
-      ).join('');
+      ).join('') || '<span style="color:var(--txt3)">No data yet</span>';
     }
 
-    // Direction breakdown
+    // ── Direction breakdown ────────────────────────────────────
     const dir = document.getElementById('st-dir');
     if (dir && d.byDirection) {
-      dir.innerHTML = Object.entries(d.byDirection).map(([direction,v]) =>
-        '<div style="margin-bottom:4px;display:flex;gap:16px">' +
-        '<span style="color:' + (direction==='BUY'?'var(--buy)':'var(--sell)') + ';width:40px">' + direction + '</span>' +
-        '<span>' + v.setups + ' setups</span>' +
-        '<span style="color:var(--buy)">' + v.entries + ' entries</span>' +
-        '<span style="color:var(--gold)">' + v.wins + ' wins</span>' +
+      dir.innerHTML = Object.entries(d.byDirection).map(([direction, v]) =>
+        '<div style="' + rowStyle + '">' +
+        '<span style="color:' + (direction==='BUY'?'var(--buy)':'var(--sell)') + ';width:40px;' + mono + '">' + direction + '</span>' +
+        '<span style="' + mono + '">' + v.setups + ' setups</span>' +
+        '<span style="color:var(--buy);' + mono + '">' + v.entries + ' entries</span>' +
+        '<span style="color:var(--gold);' + mono + '">' + v.wins + 'W ' + v.losses + 'L</span>' +
+        '<span style="color:var(--txt2);' + mono + '">' + winRateStr(v) + ' WR</span>' +
         '</div>'
       ).join('');
     }
 
-    // Recent setups
+    // ── v5.3: Entry type breakdown ─────────────────────────────
+    const etEl = document.getElementById('st-entrytype');
+    if (etEl && d.byEntryType) {
+      etEl.innerHTML = Object.keys(d.byEntryType).length
+        ? Object.entries(d.byEntryType).map(([t, v]) =>
+          '<div style="' + rowStyle + '">' +
+          '<span style="color:' + (t==='CONTINUATION'?'var(--warn)':'var(--txt)') + ';width:110px;' + mono + '">' + t + '</span>' +
+          '<span style="' + mono + '">' + v.entries + ' entries</span>' +
+          '<span style="color:var(--gold);' + mono + '">' + v.wins + 'W ' + v.losses + 'L</span>' +
+          '<span style="color:var(--txt2);' + mono + '">' + winRateStr(v) + ' WR</span>' +
+          '</div>'
+        ).join('')
+        : '<span style="color:var(--txt3)">No entries logged yet</span>';
+    }
+
+    // ── v5.3: Pullback tier breakdown ──────────────────────────
+    const pbEl = document.getElementById('st-pbtier');
+    if (pbEl && d.byPullbackTier) {
+      pbEl.innerHTML = Object.keys(d.byPullbackTier).length
+        ? Object.entries(d.byPullbackTier).map(([t, v]) =>
+          '<div style="' + rowStyle + '">' +
+          '<span style="color:var(--txt2);width:90px;' + mono + '">' + t + '</span>' +
+          '<span style="' + mono + '">' + v.entries + ' entries</span>' +
+          (v.avgPct != null ? '<span style="color:var(--txt3);' + mono + '">avg ' + v.avgPct + '%</span>' : '') +
+          '<span style="color:var(--gold);' + mono + '">' + v.wins + 'W ' + v.losses + 'L</span>' +
+          '<span style="color:var(--txt2);' + mono + '">' + winRateStr(v) + ' WR</span>' +
+          '</div>'
+        ).join('')
+        : '<span style="color:var(--txt3)">No data yet</span>';
+    }
+
+    // ── v5.3: Displacement strength ────────────────────────────
+    const dispEl = document.getElementById('st-disp');
+    if (dispEl && d.byDisplacement) {
+      dispEl.innerHTML = Object.keys(d.byDisplacement).length
+        ? Object.entries(d.byDisplacement).map(([t, v]) =>
+          '<div style="' + rowStyle + '">' +
+          '<span style="color:' + (t==='STRONG'?'var(--buy)':'var(--txt2)') + ';width:70px;' + mono + '">' + t + '</span>' +
+          '<span style="' + mono + '">' + v.entries + ' entries</span>' +
+          (v.avgRatio != null ? '<span style="color:var(--txt3);' + mono + '">avg ' + v.avgRatio + 'x</span>' : '') +
+          '<span style="color:var(--gold);' + mono + '">' + v.wins + 'W ' + v.losses + 'L</span>' +
+          '<span style="color:var(--txt2);' + mono + '">' + winRateStr(v) + ' WR</span>' +
+          '</div>'
+        ).join('')
+        : '<span style="color:var(--txt3)">No data yet</span>';
+    }
+
+    // ── v5.3: BOS type ─────────────────────────────────────────
+    const bosEl = document.getElementById('st-bos');
+    if (bosEl && d.byBOS) {
+      bosEl.innerHTML = Object.keys(d.byBOS).length
+        ? Object.entries(d.byBOS).map(([t, v]) =>
+          '<div style="' + rowStyle + '">' +
+          '<span style="color:' + (t==='M5+M15'?'var(--buy)':'var(--txt2)') + ';width:70px;' + mono + '">' + t + '</span>' +
+          '<span style="' + mono + '">' + v.entries + ' entries</span>' +
+          '<span style="color:var(--gold);' + mono + '">' + v.wins + 'W ' + v.losses + 'L</span>' +
+          '<span style="color:var(--txt2);' + mono + '">' + winRateStr(v) + ' WR</span>' +
+          '</div>'
+        ).join('')
+        : '<span style="color:var(--txt3)">No data yet</span>';
+    }
+
+    // ── Open trades ────────────────────────────────────────────
+    const openEl = document.getElementById('st-open');
+    if (openEl) {
+      if (d.openTrades && d.openTrades.length) {
+        openEl.innerHTML = d.openTrades.map(t =>
+          '<div style="' + rowStyle + '">' +
+          '<span style="color:' + (t.direction==='BUY'?'var(--buy)':'var(--sell)') + ';width:40px;' + mono + '">' + t.direction + '</span>' +
+          '<span style="color:var(--txt3);width:50px;' + mono + '">' + t.sym.replace('XAUUSD','GOLD').replace('XAGUSD','SILVER') + '</span>' +
+          '<span style="' + mono + '">@ $' + t.entry + '</span>' +
+          '<span style="color:var(--sell);' + mono + '">SL $' + t.sl + '</span>' +
+          '<span style="color:var(--buy);' + mono + '">TP $' + t.tp1 + '</span>' +
+          '<span style="color:var(--txt3);' + mono + '">' + t.openMins + 'min open</span>' +
+          '</div>'
+        ).join('');
+      } else {
+        openEl.innerHTML = '<span style="color:var(--txt3)">No open trades</span>';
+      }
+    }
+
+    // ── Recent setups ──────────────────────────────────────────
     const rec = document.getElementById('st-recent');
     if (rec && d.recentSetups) {
       rec.innerHTML = d.recentSetups.map(setup => {
         const stagesDone = Object.values(setup.stages||{}).filter(Boolean).length;
         const statusColor = setup.entryTriggered ? 'var(--buy)' : setup.invalidated ? 'var(--sell)' : 'var(--txt3)';
         const status = setup.result || (setup.entryTriggered ? 'ENTRY' : setup.invalidated ? 'INVALID' : 'ACTIVE');
-        return '<div style="padding:6px 0;border-bottom:1px solid var(--line2);display:flex;gap:12px;align-items:center">' +
+        const etBadge = setup.entryType === 'CONTINUATION'
+          ? '<span style="color:var(--warn);font-size:8px;margin-left:4px">⚡CONT</span>' : '';
+        return '<div style="padding:6px 0;border-bottom:1px solid var(--line2);display:flex;gap:10px;align-items:center">' +
           '<span style="color:' + (setup.direction==='BUY'?'var(--buy)':'var(--sell)') + ';font-family:var(--mono);font-size:9px;width:32px">' + setup.direction + '</span>' +
-          '<span style="color:var(--txt3);font-size:9px;width:36px">' + (setup.symbol==='XAUUSD'?'GOLD':'SILVER') + '</span>' +
-          '<span style="font-family:var(--mono);font-size:9px;color:var(--txt3);width:28px">' + (setup.zone?.score||'?') + '/100</span>' +
-          '<span style="font-size:9px;color:var(--txt3)">' + stagesDone + '/5 stages</span>' +
+          '<span style="color:var(--txt3);font-size:9px;width:40px">' + (setup.symbol==='XAUUSD'?'GOLD':'SILVER') + '</span>' +
+          '<span style="font-family:var(--mono);font-size:9px;color:var(--txt3);width:32px">' + (setup.zone?.score||'?') + '/100</span>' +
+          '<span style="font-size:9px;color:var(--txt3)">' + stagesDone + '/5</span>' +
+          etBadge +
           '<span style="margin-left:auto;font-family:var(--mono);font-size:9px;color:' + statusColor + '">' + status + '</span>' +
           '</div>';
       }).join('') || '<span style="color:var(--txt3)">No setups logged yet</span>';
     }
+
   } catch(e) {
     console.error('Stats load error:', e);
   }
