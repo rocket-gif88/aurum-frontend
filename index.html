@@ -778,9 +778,22 @@ async function runDebug() {
   for (const sym of ['XAUUSD', 'XAGUSD']) {
     try {
       const d = await fetch(SRV + '/debug/' + sym).then(r => r.json());
+
+      // XAGUSD uses gold-api.com synthetic engine — different response shape
+      if (sym === 'XAGUSD') {
+        const ok = d.ok && d.current_price > 0;
+        lines.push('<span class="log-line ' + (ok ? 'ok' : 'err') + '">[XAGUSD] ' +
+          (ok
+            ? '✅ gold-api.com OK — XAG spot $' + d.current_price.toFixed(3) +
+              ' | ' + d.candles_in_memory + ' candles in memory'
+            : '✗ gold-api.com error — ' + (d.error || 'no price returned')
+          ) + '</span>');
+        continue;
+      }
+
+      // XAUUSD — Twelve Data format
       const ok = d.has_values && d.candle_count > 0;
-      const cls = ok ? 'ok' : 'err';
-      lines.push('<span class="log-line ' + cls + '">[' + sym + '] ' +
+      lines.push('<span class="log-line ' + (ok ? 'ok' : 'err') + '">[' + sym + '] ' +
         (ok
           ? '✅ API OK — ' + d.candle_count + ' candles returned. Latest: ' + (d.first_candle?.datetime || '?')
           : '✗ API error — code: ' + (d.error_code||'none') + ' msg: ' + (d.error_msg||d.error||'unknown') +
