@@ -775,7 +775,7 @@ async function runDebug() {
   logEl.innerHTML = '<span style="color:var(--warn)">Running API diagnostics…</span>';
   
   const lines = [];
-  for (const sym of ['XAUUSD', 'XAGUSD']) {
+  for (const sym of ['XAUUSD']) { // Gold only
     try {
       const d = await fetch(SRV + '/debug/' + sym).then(r => r.json());
 
@@ -957,7 +957,7 @@ async function scan(btn){
 
     const tasks = [];
     if(fxau) tasks.push(analyzeWithTimeout('XAUUSD'));
-    if(fxag) tasks.push(analyzeWithTimeout('XAGUSD'));
+    // XAGUSD disabled — gold only
     const results = await Promise.all(tasks);
 
     let logLines = [];
@@ -1514,7 +1514,7 @@ async function testTelegram() {
     const token  = document.getElementById('tg-token')?.value.trim() || prefs.tgToken;
     const chatId = document.getElementById('tg-chat')?.value.trim()  || prefs.tgChat;
     if (!token || !chatId) { alert('Save your Token and Chat ID first'); return; }
-    const msg = '🔔 <b>Aurum Signals — Test Message</b>\n\nYour Telegram alerts are working correctly.\nYou will receive Gold and Silver signals here automatically during London and New York sessions.\n\n─────────────────\nAurum Signals';
+    const msg = '🔔 <b>Aurum Signals — Test Message</b>\n\nYour Telegram alerts are working correctly.\nYou will receive Gold signals here automatically during London and New York sessions.\n\n─────────────────\nAurum Signals';
     const resp = await fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
