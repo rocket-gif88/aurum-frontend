@@ -527,10 +527,10 @@ canvas{width:100% !important;display:block;}
             <div class="sp-row"><span class="sp-lbl" title="London: 07:00-16:00 UTC · New York: 13:00-22:00 UTC">Active session</span><span class="sp-val" id="sp-xau-sess" style="font-size:9px">—</span></div>
               <div class="sp-row"><span class="sp-lbl" title="Directional lean based on price position relative to Prior Day High/Low">Market bias</span><span class="sp-val" id="sp-xau-bias" style="font-size:9px;color:var(--txt3)">—</span></div>
               <div class="sp-row"><span class="sp-lbl" title="M15 higher timeframe structural bias">HTF bias (M15)</span><span class="sp-val" id="sp-xau-htf" style="font-size:9px;color:var(--txt3)">—</span></div>
-              <div class="sp-row"><span class="sp-lbl" title="H1 structural bias — true higher timeframe reference for gold (30-candle swing structure)">H1 bias</span><span class="sp-val" id="sp-xau-h1" style="font-size:9px;color:var(--txt3)">—</span></div>
+              <div class="sp-row"><span class="sp-lbl" title="H1 structural bias — true higher timeframe reference for gold">H1 bias</span><span class="sp-val" id="sp-xau-h1" style="font-size:9px;color:var(--txt3)">—</span></div>
             <div style="font-family:var(--mono);font-size:8px;color:var(--txt3);margin-top:8px;letter-spacing:.06em;margin-bottom:4px" title="Clustered liquidity zones — equal highs/lows grouped into unified areas">LIQUIDITY ZONES</div>
             <div id="sp-xau-lvls"></div>
-            <div style="font-family:var(--mono);font-size:8px;color:var(--txt3);margin-top:8px;letter-spacing:.06em;margin-bottom:4px" title="Best BUY and SELL zones tracked simultaneously — active zone shown with ACTIVE badge">DUAL ZONES</div>
+            <div style="font-family:var(--mono);font-size:8px;color:var(--txt3);margin-top:8px;letter-spacing:.06em;margin-bottom:4px" title="Best BUY and SELL zones tracked simultaneously — active zone highlighted">DUAL ZONES</div>
             <div id="sp-xau-dual"></div>
           </div>
           <div class="sp">
@@ -1124,7 +1124,7 @@ function updatePanel(id,d){
     biasEl.textContent = biasMap[d.directional_bias] || ('Neutral (score ' + biasScore + ')');
     biasEl.style.color = biasLabel==='BUY'?'var(--buy)':biasLabel==='SELL'?'var(--sell)':'var(--txt3)';
 
-  // HTF bias (M15)
+  // HTF bias
   const htfEl = document.getElementById(`sp-${id}-htf`);
   if (htfEl && d.htf_bias) {
     const htfColors = { BULLISH:'var(--buy)', BEARISH:'var(--sell)', NEUTRAL:'var(--txt3)' };
@@ -1133,7 +1133,6 @@ function updatePanel(id,d){
     htfEl.style.color = htfColors[d.htf_bias] || 'var(--txt3)';
     if (d.htf_reason) htfEl.title = d.htf_reason;
   }
-
   // H1 bias
   const h1El = document.getElementById(`sp-${id}-h1`);
   if (h1El) {
@@ -1202,36 +1201,30 @@ function updatePanel(id,d){
   } else {
     lvlEl.innerHTML='<div style="font-size:9px;color:var(--txt3);padding:4px 0">No levels detected</div>';
   }
-
-  // ── DUAL ZONES ────────────────────────────────────────────────
-  // Show best BUY zone and best SELL zone independently.
-  // Active zone (the one engine is watching this scan) gets ACTIVE badge.
+  // Dual zone display — show best BUY and SELL zone independently
   const dualEl = document.getElementById(`sp-${id}-dual`);
   if (dualEl) {
     const activeKey = d.primary_zone
       ? (Math.round(d.primary_zone.minPrice) + '-' + Math.round(d.primary_zone.maxPrice))
       : null;
-
     const renderDualZone = (zone, dir) => {
       if (!zone) return '<div style="font-size:9px;color:var(--txt3);padding:2px 0">No ' + dir + ' zone detected</div>';
-      const zColor   = dir === 'SELL' ? 'var(--sell)' : 'var(--buy)';
-      const rangeStr = '$' + parseFloat(zone.minPrice).toFixed(2) + '–$' + parseFloat(zone.maxPrice).toFixed(2);
-      const zKey     = Math.round(zone.minPrice) + '-' + Math.round(zone.maxPrice);
+      const zColor = dir === 'SELL' ? 'var(--sell)' : 'var(--buy)';
+      const rangeStr = '$' + parseFloat(zone.minPrice).toFixed(2) + '\u2013$' + parseFloat(zone.maxPrice).toFixed(2);
+      const zKey = Math.round(zone.minPrice) + '-' + Math.round(zone.maxPrice);
       const isActive = activeKey && activeKey === zKey;
-      const score    = zone.confidence?.total || zone.score || 0;
-      const activeBadge = isActive
-        ? '<span style="font-family:var(--mono);font-size:7px;padding:1px 5px;background:' + zColor + ';color:#fff;margin-left:4px;letter-spacing:.04em">ACTIVE</span>'
-        : '';
+      const score = zone.confidence?.total || zone.score || 0;
+      const badge = isActive ? '<span style="font-family:var(--mono);font-size:7px;padding:1px 5px;background:' + zColor + ';color:#fff;margin-left:4px">ACTIVE</span>' : '';
       const scoreColor = score >= 75 ? 'var(--buy)' : score >= 50 ? 'var(--warn)' : 'var(--txt3)';
-      return '<div class="lvl-item" style="border-left:2px solid ' + zColor + ';padding-left:6px;opacity:' + (isActive ? '1' : '0.55') + '" title="' + zone.totalTouches + ' touches — score ' + score + '/100">' +
-        '<span class="lvl-type" style="color:' + zColor + '">' + dir + ' ZONE</span>' +
-        '<span class="lvl-name">' + rangeStr + activeBadge + '</span>' +
+      return '<div class="lvl-item" style="border-left:2px solid ' + zColor + ';padding-left:6px;opacity:' + (isActive ? '1' : '0.5') + '">' +
+        '<span class="lvl-type" style="color:' + zColor + '">' + dir + '</span>' +
+        '<span class="lvl-name">' + rangeStr + badge + '</span>' +
         '<span class="lvl-p" style="font-size:9px;color:' + scoreColor + '">' + score + '/100</span>' +
         '</div>';
     };
-
     dualEl.innerHTML = renderDualZone(d.sell_zone, 'SELL') + renderDualZone(d.buy_zone, 'BUY');
   }
+}
 
 // SIGNAL PROCESSOR
 function processSignal(sig){
@@ -2264,8 +2257,6 @@ async function loadStats() {
     console.error('Stats load error:', e);
   }
 }
-
-} // ── close updatePanel ──
 
 // INIT
 loadPr(); renderFeed(); renderHist(); calcPerf(); setTimeout(drawEq,100); renderSetupStatus();
